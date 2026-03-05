@@ -5,8 +5,9 @@ MeshCore -> LLM channel bot (Gemini OR local LLM)
 - Connects to a MeshCore device over WiFi/TCP
 - Listens on a specific channel (e.g. #avl-ai)
 - Triggers on "!ai ..." appearing either at start of message OR after a "NAME: " prefix
-- Replies in-channel, prefixed with an @mention of the sender (e.g. "@iX-HTv4-1 ...")
+- Replies in-channel, prefixed with an @mention of the sender (e.g. "@[iX-HTv4-1] ...")
 - De-dupes duplicate inbound packets within a short window to avoid double replies
+- Adds an in-flight dedupe guard so duplicate inbound packets can't trigger TWO LLM calls concurrently
 
 LLM backends supported:
   1) Gemini via google-genai (default): LLM_BACKEND=gemini
@@ -37,8 +38,8 @@ Gemini:
 
 Ollama:
   OLLAMA_BASE_URL               (default: http://127.0.0.1:11434)
-  OLLAMA_MODEL                  (default: llama3.2:latest)  # set to whatever you pulled
-  OLLAMA_KEEP_ALIVE             (default: 5m)               # optional, passed to Ollama
+  OLLAMA_MODEL                  (default: llama3.2:latest)
+  OLLAMA_KEEP_ALIVE             (default: 5m)
 
 OpenAI-compatible:
   LOCAL_LLM_BASE_URL            (default: http://127.0.0.1:1234/v1)  # LM Studio default
@@ -131,7 +132,7 @@ async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: i
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
-    "Keep replies short and directly useful (prefer 1–3 sentences). "
+    "Keep replies short (less than 160 characters) and directly useful (prefer 1–3 sentences). "
     "If uncertain, say so briefly."
 )
 
@@ -145,12 +146,10 @@ class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
         if genai is None:
             raise RuntimeError("google-genai not installed; pip install google-genai")
-        # google-genai uses env var or client config; easiest: rely on env var GEMINI_API_KEY
         self.model = model
         self.client = genai.Client(api_key=api_key)
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        # google-genai is sync; run in thread to avoid blocking loop
         prompt_lines = [system_prompt, "", "Conversation:"]
         for role, msg in conversation:
             prompt_lines.append(f"{role}: {msg}")
@@ -175,10 +174,8 @@ class OllamaClient(LLMClient):
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        # Ollama chat API: POST /api/chat
         messages = [{"role": "system", "content": system_prompt}]
         for role, msg in conversation:
-            # map our roles to chat roles
             r = "assistant" if role == "assistant" else "user"
             messages.append({"role": r, "content": msg})
 
@@ -215,7 +212,6 @@ class OpenAICompatClient(LLMClient):
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        # OpenAI chat completions: POST /chat/completions
         url = f"{self.base_url}/chat/completions"
         headers = {}
         if self.api_key:
@@ -273,14 +269,19 @@ class ChannelLLMBot:
         self.dedupe_window_s = dedupe_window_s
         self.system_prompt = system_prompt
 
-        # trigger on body (after optional "NAME: ")
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
             channel_idx: deque(maxlen=history_turns * 2)
         }
+
+        # Serialize LLM + history + sending
         self._lock = asyncio.Lock()
-        self._seen_ts: Dict[Tuple[int, int, str], float] = {}  # (ch, sender_ts, body) -> time
+
+        # Atomic (async) dedupe: block duplicates BEFORE LLM call
+        self._dedupe_lock = asyncio.Lock()
+        self._seen_ts: Dict[Tuple[int, int, str], float] = {}     # completed
+        self._inflight: Dict[Tuple[int, int, str], float] = {}    # currently processing
 
     @staticmethod
     def split_sender_and_body(text: str) -> Tuple[str, str]:
@@ -298,6 +299,7 @@ class ChannelLLMBot:
         msg = (msg or "").strip()
         if not msg:
             return ""
+        # user's request: add [ ] wrapper around NAME
         return f"@[{sender}] {msg}" if sender else msg
 
     def extract_after_trigger(self, body: str) -> str:
@@ -310,32 +312,56 @@ class ChannelLLMBot:
             return ""
         return b[idx + len(self.trigger):].strip(" \t:,-")
 
-    def _dedupe_drop(self, payload: dict, body: str) -> bool:
+    async def _dedupe_enter(self, payload: dict, body: str) -> Optional[Tuple[int, int, str]]:
+        """
+        Returns a dedupe key if processing should continue.
+        Returns None if this message is a duplicate (seen recently or already in-flight).
+        """
         ch = payload.get("channel_idx")
         st = payload.get("sender_timestamp")
+
         if not isinstance(ch, int) or not isinstance(st, int):
-            return False
+            # Can't reliably dedupe; allow processing
+            return (-1, -1, body)
 
         key = (ch, st, body)
         now = time.time()
 
-        for k, t0 in list(self._seen_ts.items()):
-            if now - t0 > self.dedupe_window_s:
-                self._seen_ts.pop(k, None)
+        async with self._dedupe_lock:
+            # purge old entries
+            for k, t0 in list(self._seen_ts.items()):
+                if now - t0 > self.dedupe_window_s:
+                    self._seen_ts.pop(k, None)
 
-        if key in self._seen_ts:
-            if self.debug:
-                print(f"[DBG] duplicate dropped key={key}")
-            return True
+            # inflight should not stick forever; safety purge
+            inflight_ttl = max(self.dedupe_window_s, 30.0)
+            for k, t0 in list(self._inflight.items()):
+                if now - t0 > inflight_ttl:
+                    self._inflight.pop(k, None)
 
-        self._seen_ts[key] = now
-        return False
+            if key in self._seen_ts:
+                if self.debug:
+                    print(f"[DBG] duplicate dropped (seen) key={key}")
+                return None
+
+            if key in self._inflight:
+                if self.debug:
+                    print(f"[DBG] duplicate dropped (inflight) key={key}")
+                return None
+
+            # mark inflight immediately (atomic)
+            self._inflight[key] = now
+            return key
+
+    async def _dedupe_exit(self, key: Tuple[int, int, str]) -> None:
+        now = time.time()
+        async with self._dedupe_lock:
+            self._inflight.pop(key, None)
+            self._seen_ts[key] = now
 
     def build_conversation(self, user_text: str) -> List[Tuple[str, str]]:
-        # keep simple history on the channel
         hist = list(self.history[self.channel_idx])
-        convo = hist + [("user", user_text)]
-        return convo
+        return hist + [("user", user_text)]
 
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
@@ -351,40 +377,46 @@ class ChannelLLMBot:
 
         sender, body = self.split_sender_and_body(text)
 
-        if self._dedupe_drop(p, body):
+        dedupe_key = await self._dedupe_enter(p, body)
+        if dedupe_key is None:
             return
 
-        if self.debug:
-            print(f"[DBG] target-channel msg payload={p}")
+        try:
+            if self.debug:
+                print(f"[DBG] target-channel msg payload={p}")
 
-        user = self.extract_after_trigger(body)
-        if not user:
-            return
-
-        async with self._lock:
-            if user.lower() == "ping":
-                out = self.format_reply(sender, "pong")
-                if out:
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+            user = self.extract_after_trigger(body)
+            if not user:
                 return
 
-            # update history & call LLM
-            self.history[self.channel_idx].append(("user", user))
-            conversation = self.build_conversation(user)
+            async with self._lock:
+                # quick ping
+                if user.lower() == "ping":
+                    out = self.format_reply(sender, "pong")
+                    if out:
+                        await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+                    return
 
-            try:
-                answer = await self.llm.generate(self.system_prompt, conversation)
-            except Exception as e:
-                answer = f"LLM error: {e}"
+                # update history & call LLM
+                self.history[self.channel_idx].append(("user", user))
+                conversation = self.build_conversation(user)
 
-            self.history[self.channel_idx].append(("assistant", answer))
+                try:
+                    answer = await self.llm.generate(self.system_prompt, conversation)
+                except Exception as e:
+                    answer = f"LLM error: {e}"
 
-            parts = chunk_text(answer, self.max_reply_chars)
-            for i, part in enumerate(parts, start=1):
-                msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                out = self.format_reply(sender, msg)
-                if out:
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+                self.history[self.channel_idx].append(("assistant", answer))
+
+                parts = chunk_text(answer, self.max_reply_chars)
+                for i, part in enumerate(parts, start=1):
+                    msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                    out = self.format_reply(sender, msg)
+                    if out:
+                        await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+
+        finally:
+            await self._dedupe_exit(dedupe_key)
 
 
 async def main() -> None:
@@ -404,7 +436,6 @@ async def main() -> None:
 
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
-    # LLM backend selection
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
     llm: LLMClient
@@ -436,7 +467,6 @@ async def main() -> None:
 
     chan_idx = await resolve_channel_idx(mesh, channel_name, max_channels=scan_max)
 
-    # show map
     print("[OK] Channel map:")
     for i in range(scan_max):
         ev = await mesh.commands.get_channel(i)
@@ -466,9 +496,15 @@ async def main() -> None:
     if backend == "gemini":
         print(f"[LLM] model={env_str('GEMINI_MODEL', 'gemini-3-flash-preview')}")
     elif backend == "ollama":
-        print(f"[LLM] model={env_str('OLLAMA_MODEL', 'llama3.2:latest')} url={env_str('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')}")
+        print(
+            f"[LLM] model={env_str('OLLAMA_MODEL', 'llama3.2:latest')} "
+            f"url={env_str('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')}"
+        )
     else:
-        print(f"[LLM] model={env_str('LOCAL_LLM_MODEL', 'local-model')} url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}")
+        print(
+            f"[LLM] model={env_str('LOCAL_LLM_MODEL', 'local-model')} "
+            f"url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}"
+        )
 
     print(f"[TEST] In {channel_name}, send: '{trigger} ping' or 'NAME: {trigger} ping' (expect: @NAME pong)")
 
