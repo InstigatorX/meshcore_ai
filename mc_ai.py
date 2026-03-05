@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MeshCore -> Gemini channel bot
+MeshCore -> LLM channel bot (Gemini OR local LLM)
 
 - Connects to a MeshCore device over WiFi/TCP
 - Listens on a specific channel (e.g. #avl-ai)
@@ -8,18 +8,43 @@ MeshCore -> Gemini channel bot
 - Replies in-channel, prefixed with an @mention of the sender (e.g. "@iX-HTv4-1 ...")
 - De-dupes duplicate inbound packets within a short window to avoid double replies
 
-Env vars:
-  GEMINI_API_KEY                (required) Gemini API key
-  MESHCORE_HOST                 (required) MeshCore TCP host/IP
+LLM backends supported:
+  1) Gemini via google-genai (default): LLM_BACKEND=gemini
+  2) Ollama (local):                 LLM_BACKEND=ollama
+  3) OpenAI-compatible local server: LLM_BACKEND=openai_compat
+     (LM Studio, Open WebUI, vLLM, llama.cpp server in OpenAI mode, etc.)
+
+Env vars (MeshCore):
+  MESHCORE_HOST                 (required)
   MESHCORE_PORT                 (default: 5000)
   MESHCORE_CHANNEL_NAME         (default: #avl-ai)  (accepts with/without leading #)
   CHANNEL_SCAN_MAX              (default: 16)
-  AI_TRIGGER                    (default: !ai)  (NOTE: in bash use single quotes: export AI_TRIGGER='!ai')
+
+Env vars (Bot):
+  AI_TRIGGER                    (default: !ai)  (bash: export AI_TRIGGER='!ai')
+  MAX_REPLY_CHARS               (default: 180)
+  HISTORY_TURNS                 (default: 6)
+  DEBUG                         (default: 0)
+  DEDUPE_WINDOW_S               (default: 3.0)
+
+Env vars (LLM selection):
+  LLM_BACKEND                   (default: gemini) one of: gemini | ollama | openai_compat
+  SYSTEM_PROMPT                 (optional) overrides the system prompt used for all backends
+
+Gemini:
+  GEMINI_API_KEY                (required if LLM_BACKEND=gemini)
   GEMINI_MODEL                  (default: gemini-3-flash-preview)
-  MAX_REPLY_CHARS               (default: 180)  chunk size per mesh message
-  HISTORY_TURNS                 (default: 6)    turns to keep per channel
-  DEBUG                         (default: 0)    set to 1 for verbose
-  DEDUPE_WINDOW_S               (default: 3.0)  seconds to treat identical inbound as duplicate
+
+Ollama:
+  OLLAMA_BASE_URL               (default: http://127.0.0.1:11434)
+  OLLAMA_MODEL                  (default: llama3.2:latest)  # set to whatever you pulled
+  OLLAMA_KEEP_ALIVE             (default: 5m)               # optional, passed to Ollama
+
+OpenAI-compatible:
+  LOCAL_LLM_BASE_URL            (default: http://127.0.0.1:1234/v1)  # LM Studio default
+  LOCAL_LLM_MODEL               (default: local-model)
+  LOCAL_LLM_API_KEY             (optional)
+  LOCAL_LLM_TEMPERATURE         (default: 0.3)
 """
 
 import asyncio
@@ -27,10 +52,16 @@ import os
 import re
 import time
 from collections import deque
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Tuple, Optional
 
-from google import genai
+import httpx
 from meshcore import MeshCore, EventType
+
+# Gemini is optional now; only imported if used
+try:
+    from google import genai  # type: ignore
+except Exception:
+    genai = None  # noqa: N816
 
 
 def env_int(name: str, default: int) -> int:
@@ -64,8 +95,7 @@ def chunk_text(text: str, max_len: int) -> List[str]:
 
     chunks: List[str] = []
     cur = ""
-    # split preserving whitespace tokens
-    for tok in re.split(r"(\s+)", text):
+    for tok in re.split(r"(\s+)", text):  # keep whitespace tokens
         if len(cur) + len(tok) <= max_len:
             cur += tok
         else:
@@ -87,7 +117,6 @@ async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: i
         if not isinstance(payload, dict):
             continue
 
-        # observed payload key: channel_name
         got_raw = payload.get("channel_name") or payload.get("name") or payload.get("chan_name") or ""
         got = normalize_channel_name(str(got_raw))
         if got == want:
@@ -96,54 +125,170 @@ async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: i
     raise RuntimeError(f"Channel '{channel_name}' not found in first {max_channels} channel slots")
 
 
-class ChannelGeminiBot:
+# ---------------------------
+# LLM clients (Gemini/Ollama/OpenAI-compat)
+# ---------------------------
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
+    "Keep replies short and directly useful (prefer 1–3 sentences). "
+    "If uncertain, say so briefly."
+)
+
+
+class LLMClient:
+    async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
+        raise NotImplementedError
+
+
+class GeminiClient(LLMClient):
+    def __init__(self, api_key: str, model: str):
+        if genai is None:
+            raise RuntimeError("google-genai not installed; pip install google-genai")
+        # google-genai uses env var or client config; easiest: rely on env var GEMINI_API_KEY
+        self.model = model
+        self.client = genai.Client(api_key=api_key)
+
+    async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
+        # google-genai is sync; run in thread to avoid blocking loop
+        prompt_lines = [system_prompt, "", "Conversation:"]
+        for role, msg in conversation:
+            prompt_lines.append(f"{role}: {msg}")
+        prompt_lines.append("assistant:")
+        prompt = "\n".join(prompt_lines)
+
+        def _call():
+            resp = self.client.models.generate_content(model=self.model, contents=prompt)
+            txt = getattr(resp, "text", None)
+            return str(txt).strip() if txt else ""
+
+        txt = await asyncio.to_thread(_call)
+        return txt or "I couldn’t generate a response."
+
+
+class OllamaClient(LLMClient):
+    def __init__(self, base_url: str, model: str, keep_alive: str = "5m", timeout_s: float = 60.0):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.keep_alive = keep_alive
+        self.timeout = timeout_s
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
+
+    async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
+        # Ollama chat API: POST /api/chat
+        messages = [{"role": "system", "content": system_prompt}]
+        for role, msg in conversation:
+            # map our roles to chat roles
+            r = "assistant" if role == "assistant" else "user"
+            messages.append({"role": r, "content": msg})
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": self.keep_alive,
+        }
+        url = f"{self.base_url}/api/chat"
+        r = await self._http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        content = (data.get("message") or {}).get("content", "")
+        return (content or "").strip() or "I couldn’t generate a response."
+
+    async def aclose(self):
+        await self._http.aclose()
+
+
+class OpenAICompatClient(LLMClient):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        temperature: float = 0.3,
+        timeout_s: float = 60.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.temperature = temperature
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
+
+    async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
+        # OpenAI chat completions: POST /chat/completions
+        url = f"{self.base_url}/chat/completions"
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for role, msg in conversation:
+            r = "assistant" if role == "assistant" else "user"
+            messages.append({"role": r, "content": msg})
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+
+        r = await self._http.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return "I couldn’t generate a response."
+        content = ((choices[0].get("message") or {}).get("content")) or ""
+        return str(content).strip() or "I couldn’t generate a response."
+
+    async def aclose(self):
+        await self._http.aclose()
+
+
+# ---------------------------
+# Bot
+# ---------------------------
+
+class ChannelLLMBot:
     def __init__(
         self,
         mesh: MeshCore,
-        gemini_client: genai.Client,
+        llm: LLMClient,
         channel_idx: int,
         channel_label: str,
         trigger: str,
-        model: str,
         max_reply_chars: int,
         history_turns: int,
         dedupe_window_s: float,
         debug: bool,
+        system_prompt: str,
     ):
         self.mesh = mesh
-        self.gemini = gemini_client
+        self.llm = llm
         self.channel_idx = channel_idx
         self.channel_label = channel_label
         self.trigger = trigger
-        self.model = model
         self.max_reply_chars = max_reply_chars
         self.debug = debug
         self.dedupe_window_s = dedupe_window_s
+        self.system_prompt = system_prompt
 
-        # Accept trigger at start or after "NAME: "
-        # We apply this to the BODY (after optional sender prefix split)
+        # trigger on body (after optional "NAME: ")
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
             channel_idx: deque(maxlen=history_turns * 2)
         }
         self._lock = asyncio.Lock()
-
-        # De-dupe recent inbound messages
-        self._seen_ts: Dict[Tuple[int, int, str], float] = {}  # key -> time.time()
+        self._seen_ts: Dict[Tuple[int, int, str], float] = {}  # (ch, sender_ts, body) -> time
 
     @staticmethod
     def split_sender_and_body(text: str) -> Tuple[str, str]:
-        """
-        If message looks like 'NAME: something', return ('NAME', 'something').
-        Otherwise return ('', original_text).
-        """
         t = (text or "").strip()
         if ": " in t:
             name, body = t.split(": ", 1)
             name = name.strip()
             body = body.strip()
-            # Basic guard: treat very long prefixes as not-a-name
             if name and len(name) <= 40:
                 return name, body
         return "", t
@@ -156,27 +301,16 @@ class ChannelGeminiBot:
         return f"@{sender} {msg}" if sender else msg
 
     def extract_after_trigger(self, body: str) -> str:
-        """
-        Find trigger token in body and return text after it.
-        Examples:
-          "!ai ping" -> "ping"
-          "foo !ai ping" -> "ping"  (rare but supported)
-        """
         b = (body or "").strip()
         m = self.trigger_re.search(b)
         if not m:
             return ""
-        # find the actual "!ai" occurrence start in the match and slice from its end
-        # easiest: locate the trigger case-insensitively and slice after first occurrence
         idx = b.lower().find(self.trigger.lower())
         if idx < 0:
             return ""
-        return b[idx + len(self.trigger) :].strip(" \t:,-")
+        return b[idx + len(self.trigger):].strip(" \t:,-")
 
     def _dedupe_drop(self, payload: dict, body: str) -> bool:
-        """
-        Returns True if this message is a duplicate and should be dropped.
-        """
         ch = payload.get("channel_idx")
         st = payload.get("sender_timestamp")
         if not isinstance(ch, int) or not isinstance(st, int):
@@ -185,7 +319,6 @@ class ChannelGeminiBot:
         key = (ch, st, body)
         now = time.time()
 
-        # purge old
         for k, t0 in list(self._seen_ts.items()):
             if now - t0 > self.dedupe_window_s:
                 self._seen_ts.pop(k, None)
@@ -198,36 +331,17 @@ class ChannelGeminiBot:
         self._seen_ts[key] = now
         return False
 
-    def build_prompt(self, user_text: str) -> str:
+    def build_conversation(self, user_text: str) -> List[Tuple[str, str]]:
+        # keep simple history on the channel
         hist = list(self.history[self.channel_idx])
-        lines = [
-            "You are a concise assistant replying over a low-bandwidth MeshCore channel.",
-            "Keep replies short and directly useful. Prefer 1-3 sentences.",
-            "If uncertain, say so briefly.",
-            "",
-            f"Channel: {self.channel_label}",
-            "",
-            "Conversation:",
-        ]
-        for role, msg in hist:
-            lines.append(f"{role}: {msg}")
-        lines.append(f"user: {user_text}")
-        lines.append("assistant:")
-        return "\n".join(lines)
-
-    async def call_gemini(self, prompt: str) -> str:
-        resp = self.gemini.models.generate_content(model=self.model, contents=prompt)
-        txt = getattr(resp, "text", None)
-        if not txt or not str(txt).strip():
-            return "I couldn’t generate a response."
-        return str(txt).strip()
+        convo = hist + [("user", user_text)]
+        return convo
 
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
 
-        # only our channel
         if p.get("channel_idx") != self.channel_idx:
             return
 
@@ -237,7 +351,6 @@ class ChannelGeminiBot:
 
         sender, body = self.split_sender_and_body(text)
 
-        # drop duplicates (common to see dupes on some setups)
         if self._dedupe_drop(p, body):
             return
 
@@ -249,28 +362,24 @@ class ChannelGeminiBot:
             return
 
         async with self._lock:
-            # ping
             if user.lower() == "ping":
                 out = self.format_reply(sender, "pong")
                 if out:
                     await self.mesh.commands.send_chan_msg(self.channel_idx, out)
                 return
 
-            # Gemini
+            # update history & call LLM
             self.history[self.channel_idx].append(("user", user))
-            prompt = self.build_prompt(user)
+            conversation = self.build_conversation(user)
 
             try:
-                answer = await self.call_gemini(prompt)
+                answer = await self.llm.generate(self.system_prompt, conversation)
             except Exception as e:
-                answer = f"Gemini error: {e}"
+                answer = f"LLM error: {e}"
 
             self.history[self.channel_idx].append(("assistant", answer))
 
             parts = chunk_text(answer, self.max_reply_chars)
-            if not parts:
-                return
-
             for i, part in enumerate(parts, start=1):
                 msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
                 out = self.format_reply(sender, msg)
@@ -279,8 +388,6 @@ class ChannelGeminiBot:
 
 
 async def main() -> None:
-    if not os.getenv("GEMINI_API_KEY", "").strip():
-        raise SystemExit("Missing GEMINI_API_KEY")
     host = env_str("MESHCORE_HOST", "")
     if not host:
         raise SystemExit("Missing MESHCORE_HOST")
@@ -290,11 +397,39 @@ async def main() -> None:
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
-    model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
     max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
     debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
+
+    system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+
+    # LLM backend selection
+    backend = env_str("LLM_BACKEND", "gemini").lower()
+
+    llm: LLMClient
+    if backend == "gemini":
+        api_key = env_str("GEMINI_API_KEY", "")
+        if not api_key:
+            raise SystemExit("Missing GEMINI_API_KEY (required for LLM_BACKEND=gemini)")
+        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
+        llm = GeminiClient(api_key=api_key, model=model)
+
+    elif backend == "ollama":
+        base_url = env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        model = env_str("OLLAMA_MODEL", "llama3.2:latest")
+        keep_alive = env_str("OLLAMA_KEEP_ALIVE", "5m")
+        llm = OllamaClient(base_url=base_url, model=model, keep_alive=keep_alive)
+
+    elif backend == "openai_compat":
+        base_url = env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+        model = env_str("LOCAL_LLM_MODEL", "local-model")
+        api_key = env_str("LOCAL_LLM_API_KEY", "") or None
+        temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
+        llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
+
+    else:
+        raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
     mesh = await MeshCore.create_tcp(host, port, auto_reconnect=True)
     await mesh.start_auto_message_fetching()
@@ -311,25 +446,30 @@ async def main() -> None:
         if isinstance(payload, dict):
             print(f"  idx={i} -> {payload.get('channel_name')}")
 
-    gemini_client = genai.Client()
-    bot = ChannelGeminiBot(
+    bot = ChannelLLMBot(
         mesh=mesh,
-        gemini_client=gemini_client,
+        llm=llm,
         channel_idx=chan_idx,
         channel_label=channel_name,
         trigger=trigger,
-        model=model,
         max_reply_chars=max_reply_chars,
         history_turns=history_turns,
         dedupe_window_s=dedupe_window_s,
         debug=debug,
+        system_prompt=system_prompt,
     )
 
     mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
 
-    print(
-        f"[OK] Connected: {host}:{port} | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'"
-    )
+    print(f"[OK] Connected: {host}:{port} | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
+    print(f"[LLM] backend={backend}")
+    if backend == "gemini":
+        print(f"[LLM] model={env_str('GEMINI_MODEL', 'gemini-3-flash-preview')}")
+    elif backend == "ollama":
+        print(f"[LLM] model={env_str('OLLAMA_MODEL', 'llama3.2:latest')} url={env_str('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')}")
+    else:
+        print(f"[LLM] model={env_str('LOCAL_LLM_MODEL', 'local-model')} url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}")
+
     print(f"[TEST] In {channel_name}, send: '{trigger} ping' or 'NAME: {trigger} ping' (expect: @NAME pong)")
 
     await asyncio.sleep(float("inf"))
