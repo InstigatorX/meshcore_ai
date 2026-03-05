@@ -1,39 +1,27 @@
-MeshCore Gemini AI Bot
+# MeshCore AI Bot
+### AI-powered assistant for MeshCore radio networks
 
-A lightweight Python bot that connects to a MeshCore radio over Wi-Fi/TCP and allows users on a mesh channel to interact with Google Gemini AI.
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![MeshCore](https://img.shields.io/badge/MeshCore-TCP-orange)
+![LLM](https://img.shields.io/badge/AI-Gemini%20%7C%20Ollama%20%7C%20Local-purple)
 
-Users can send commands like:
+A lightweight Python bot that connects to a **MeshCore radio over Wi-Fi/TCP** and allows users on a mesh channel to interact with **AI models**.
 
-!ai where is Paris?
+Supported AI backends:
 
-The bot will respond in-channel and mention the user:
+- 🌐 **Google Gemini**
+- 🖥 **Ollama (local LLM)**
+- 🧠 **OpenAI-compatible servers**  
+  (LM Studio, Open WebUI, vLLM, llama.cpp server)
 
-@iX-HTv4-1 Paris is the capital of France, located in north-central France along the Seine River.
+The bot is optimized for **low-bandwidth mesh networks** and automatically splits long responses into smaller packets.
 
-The bot is optimized for low-bandwidth mesh networks, keeping responses concise and splitting longer replies into multiple packets.
+---
 
-⸻
+# Example
 
-Features
-	•	Works with MeshCore TCP interface
-	•	Channel-based listening (ex: #avl-ai)
-	•	Trigger commands (!ai)
-	•	Responds with @mentions to the sender
-	•	Handles messages formatted like:
-
-!ai question
-NAME: !ai question
-
-	•	De-duplicates repeated packets (common on mesh networks)
-	•	Splits long AI responses into multiple mesh messages
-	•	Maintains short conversation context for better answers
-	•	Fully configurable via environment variables
-
-⸻
-
-Example
-
-User message:
+User message on mesh:
 
 iX-HTv4-1: !ai what is the tallest mountain?
 
@@ -41,112 +29,146 @@ Bot response:
 
 @iX-HTv4-1 Mount Everest is the tallest mountain on Earth at 8,848 meters above sea level.
 
+---
 
-⸻
+# Architecture
 
-Requirements
-	•	Python 3.10+
-	•	A MeshCore node with TCP enabled
-	•	A Google Gemini API key
+      Mesh Radio Network
+            │
+            │
+    ┌───────▼────────┐
+    │   MeshCore Node │
+    │  TCP Interface  │
+    └───────┬────────┘
+            │
+            │ TCP
+            │
+    ┌───────▼────────┐
+    │   Python Bot   │
+    │   mc_ai.py     │
+    └───────┬────────┘
+            │
+   ┌────────┴───────────┐
+   │                    │
+   ▼                    ▼
 
-⸻
+Google Gemini       Local LLM
+(Ollama /
+LM Studio /
+Open WebUI)
 
-Installation
+---
 
-1. Clone the repository
+# Features
 
-git clone https://github.com/YOURNAME/meshcore-gemini-bot.git
-cd meshcore-gemini-bot
+- Works with **MeshCore TCP interface**
+- Channel-based listening (`#avl-ai`, etc.)
+- Trigger commands (`!ai`)
+- Replies with **@mentions**
+- Handles:
 
+!ai question
+NAME: !ai question
 
-⸻
+- Duplicate packet suppression
+- Response chunking for mesh packet limits
+- Conversation memory
+- Works with **cloud AI or fully local AI**
 
-Create a Python Virtual Environment
+---
 
-Using a virtual environment keeps dependencies isolated from your system Python.
+# Requirements
 
-Create the venv
+- Python **3.10+**
+- MeshCore node with **TCP enabled**
+- One of:
+  - Gemini API key
+  - Ollama installed
+  - OpenAI-compatible LLM server
+
+---
+
+# Installation
+
+## Clone the repository
+
+git clone https://github.com/YOURUSER/meshcore-ai-bot.git
+cd meshcore-ai-bot
+
+---
+
+# Create a Virtual Environment
+
+Using a virtual environment prevents dependency conflicts.
 
 python3 -m venv venv
 
-This creates:
-
-meshcore-gemini-bot/
-  venv/
-  mc_ai.py
-
-Activate the venv
+Activate it.
 
 Linux / macOS:
 
 source venv/bin/activate
 
-Your prompt should now show:
+You should now see:
 
 (venv)
 
+---
 
-⸻
+# Install Dependencies
 
-Install Dependencies
+pip install –upgrade pip
+pip install meshcore google-genai httpx
 
-pip install --upgrade pip
-pip install meshcore google-genai
-
-Optional: save dependencies
+Optional:
 
 pip freeze > requirements.txt
 
+---
 
-⸻
+# Configuration
 
-Configure Environment Variables
+Minimum configuration:
 
-Set the required variables before running the bot.
+export MESHCORE_HOST=“192.168.83.119”
+export AI_TRIGGER=’!ai’
 
-export GEMINI_API_KEY="YOUR_API_KEY"
-export MESHCORE_HOST="192.168.1.100"
+Example configuration:
 
-Optional configuration:
-
-export MESHCORE_PORT="5000"
-export MESHCORE_CHANNEL_NAME="#avl-ai"
-export AI_TRIGGER='!ai'
+export MESHCORE_HOST=“192.168.83.119”
+export MESHCORE_PORT=“5000”
+export MESHCORE_CHANNEL_NAME=”#avl-ai”
+export AI_TRIGGER=’!ai’
 export DEBUG=1
 
-Important
+⚠️ **Important**
 
-When setting !ai in bash, use single quotes:
+Always quote `!ai` in bash:
 
-export AI_TRIGGER='!ai'
+export AI_TRIGGER=’!ai’
 
-Otherwise bash will interpret ! as a history expansion.
+Otherwise bash interprets `!` as history expansion.
 
-⸻
+---
 
-Running the Bot
-
-Start the bot:
+# Running the Bot
 
 python mc_ai.py
 
-Example output:
+Example startup output:
 
 [OK] Channel map:
-  idx=0 -> Public
-  idx=1 -> Loebees
-  idx=2 -> #avl-ai
+idx=0 -> Public
+idx=1 -> Loebees
+idx=2 -> #avl-ai
 
-[OK] Connected: 192.168.83.119:5000 | listening on #avl-ai (idx=2)
+[OK] Connected: 192.168.83.119:5000 | listening on #avl-ai
 
+---
 
-⸻
+# Using the Bot
 
-Using the Bot
-
-Send commands in the configured mesh channel.
-
-Example:
+Test command:
 
 !ai ping
 
@@ -156,55 +178,105 @@ Response:
 
 Ask a question:
 
-!ai what causes lightning?
+!ai why is the sky blue?
 
-Bot response:
+---
 
-@YourNode Lightning forms when electrical charge builds up in clouds and discharges toward the ground or another cloud.
+# AI Backend Options
 
+The bot supports **three LLM backends**.
 
-⸻
+Select one:
 
-Configuration
+export LLM_BACKEND=gemini
 
-Variable	Default	Description
-GEMINI_API_KEY	required	Google Gemini API key
-MESHCORE_HOST	required	MeshCore node IP
-MESHCORE_PORT	5000	MeshCore TCP port
-MESHCORE_CHANNEL_NAME	#avl-ai	Channel to listen on
-AI_TRIGGER	!ai	Command prefix
-MAX_REPLY_CHARS	180	Max characters per mesh message
-HISTORY_TURNS	6	AI conversation context length
-DEBUG	0	Enable verbose logging
+or
 
+export LLM_BACKEND=ollama
 
-⸻
+or
 
-Notes About Mesh Networks
+export LLM_BACKEND=openai_compat
 
-Mesh protocols often retransmit packets. This bot includes duplicate suppression so it won’t reply multiple times to the same message.
+---
 
-Additionally, some radios do not echo messages sent from the same node. If testing the bot, send commands from a different mesh node.
+# Using Google Gemini
 
-⸻
+export LLM_BACKEND=gemini
+export GEMINI_API_KEY=“YOUR_API_KEY”
+export GEMINI_MODEL=“gemini-3-flash-preview”
 
-Security
+Run:
 
-Never commit your API key.
+python mc_ai.py
 
-Use environment variables or a .env file ignored by Git.
+---
 
-Example .gitignore entry:
+# Using Ollama (Local AI)
 
-.env
-venv/
+Install Ollama:
 
+https://ollama.com
 
-⸻
+Pull a model:
 
-Running as a Background Service (Optional)
+ollama pull llama3.2
 
-Example using tmux:
+Configure the bot:
+
+export LLM_BACKEND=ollama
+export OLLAMA_BASE_URL=“http://127.0.0.1:11434”
+export OLLAMA_MODEL=“llama3.2”
+
+Run:
+
+python mc_ai.py
+
+---
+
+# Using LM Studio or Other OpenAI-Compatible Servers
+
+Example for **LM Studio**:
+
+export LLM_BACKEND=openai_compat
+export LOCAL_LLM_BASE_URL=“http://127.0.0.1:1234/v1”
+export LOCAL_LLM_MODEL=“local-model”
+
+Run:
+
+python mc_ai.py
+
+---
+
+# Configuration Options
+
+| Variable | Default | Description |
+|--------|--------|--------|
+| `MESHCORE_HOST` | required | MeshCore node IP |
+| `MESHCORE_PORT` | 5000 | MeshCore TCP port |
+| `MESHCORE_CHANNEL_NAME` | #avl-ai | Channel to listen on |
+| `AI_TRIGGER` | !ai | Command prefix |
+| `LLM_BACKEND` | gemini | AI backend |
+| `MAX_REPLY_CHARS` | 180 | Max characters per message |
+| `HISTORY_TURNS` | 6 | Conversation context |
+| `DEBUG` | 0 | Enable verbose logs |
+
+---
+
+# Mesh Network Considerations
+
+Mesh networks often retransmit packets.
+
+This bot includes **duplicate suppression** to prevent multiple responses.
+
+Some radios also **do not echo their own transmissions**.  
+When testing, send commands from a **different mesh node**.
+
+---
+
+# Running as a Background Service
+
+Example using **tmux**:
 
 tmux new -s meshbot
 source venv/bin/activate
@@ -214,25 +286,39 @@ Detach:
 
 CTRL+B D
 
+---
 
-⸻
+# Security
 
-Future Ideas
-	•	Weather commands
-	•	Node status queries
-	•	Mesh telemetry summaries
-	•	Local LLM support
-	•	Store-and-forward summaries
-	•	Multi-channel support
+Never commit API keys to GitHub.
 
-⸻
+Recommended `.gitignore`:
 
-License
+venv/
+.env
+pycache/
+
+---
+
+# Future Ideas
+
+Possible enhancements:
+
+- Weather command
+- Node telemetry queries
+- Emergency alert summarization
+- Multi-channel AI
+- RAG document search
+- Voice-to-mesh gateway
+
+---
+
+# License
 
 MIT License
 
-⸻
+---
 
-Contributing
+# Contributing
 
-Pull requests and improvements are welcome.
+Pull requests, ideas, and improvements are welcome.
