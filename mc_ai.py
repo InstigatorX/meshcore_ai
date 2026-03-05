@@ -298,7 +298,7 @@ class ChannelLLMBot:
         msg = (msg or "").strip()
         if not msg:
             return ""
-        return f"@{sender} {msg}" if sender else msg
+        return f"@[{sender}] {msg}" if sender else msg
 
     def extract_after_trigger(self, body: str) -> str:
         b = (body or "").strip()
