@@ -1,5 +1,3 @@
-:::writing{variant=“standard” id=“48261”}
-
 MeshCore Gemini AI Bot
 
 A lightweight Python bot that connects to a MeshCore radio over Wi-Fi/TCP and allows users on a mesh channel to interact with Google Gemini AI.
@@ -238,4 +236,3 @@ MIT License
 Contributing
 
 Pull requests and improvements are welcome.
-:::
