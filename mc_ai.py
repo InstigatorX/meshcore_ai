@@ -716,7 +716,7 @@ async def run_bot_once() -> None:
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
-    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
+    max_reply_chars = env_int("MAX_REPLY_CHARS", 140)
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
     debug = env_bool("DEBUG", False)
@@ -729,7 +729,7 @@ async def run_bot_once() -> None:
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
         if not api_key:
-            raise SystemExit("Missing GEMINI_API_KEY (required for LLM_BACKEND=gemini)")
+            raise RuntimeError("Missing GEMINI_API_KEY")
         model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
         llm = GeminiClient(api_key=api_key, model=model)
     elif backend == "ollama":
@@ -744,8 +744,9 @@ async def run_bot_once() -> None:
         temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
         llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
     else:
-        raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+        raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
+    print("[INFO] connecting to MeshCore...")
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
@@ -783,20 +784,43 @@ async def run_bot_once() -> None:
     await bot.refresh_contacts_best_effort()
 
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
-    print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
-    print(f"[LLM] backend={backend}")
-    print(f"[CTX] INCLUDE_REQUESTER_CONTEXT={1 if include_requester_context else 0}")
 
-    disconnect_waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    loop = asyncio.get_running_loop()
+    disconnect_future: asyncio.Future[None] = loop.create_future()
 
-    async def disconnected_handler(ev) -> None:
-        print("[WARN] MeshCore disconnected")
-        if not disconnect_waiter.done():
-            disconnect_waiter.set_exception(ConnectionError("MeshCore disconnected"))
+    async def on_disconnected(ev) -> None:
+        print("[WARN] MeshCore disconnected event received")
+        if not disconnect_future.done():
+            disconnect_future.set_result(None)
 
-    mesh.subscribe(EventType.DISCONNECTED, disconnected_handler)
+    mesh.subscribe(EventType.DISCONNECTED, on_disconnected)
 
-    await disconnect_waiter
+    # Optional heartbeat check in case DISCONNECTED is never emitted
+    async def health_monitor() -> None:
+        while not disconnect_future.done():
+            try:
+                ev = await mesh.commands.get_channel(chan_idx)
+                if ev.type == EventType.ERROR:
+                    print("[WARN] health check failed; forcing reconnect")
+                    disconnect_future.set_result(None)
+                    return
+            except Exception as e:
+                print(f"[WARN] health check exception: {e}")
+                if not disconnect_future.done():
+                    disconnect_future.set_result(None)
+                return
+            await asyncio.sleep(10)
+
+    monitor_task = asyncio.create_task(health_monitor())
+
+    try:
+        await disconnect_future
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
 async def main() -> None:
     reconnect_delay = env_int("RECONNECT_DELAY_S", 5)
@@ -808,8 +832,9 @@ async def main() -> None:
             raise
         except Exception as e:
             print(f"[WARN] bot session ended: {e}")
-            print(f"[INFO] reconnecting in {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
+
+        print(f"[INFO] reconnecting in {reconnect_delay}s...")
+        await asyncio.sleep(reconnect_delay)
 
 if __name__ == "__main__":
     asyncio.run(main())
