@@ -3,11 +3,51 @@
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + listens to channel messages AND direct messages
 
-DM replies require a destination with full 'public_key'. We resolve DM sender via
-pubkey_prefix by caching contacts.
+Features
+- Connects over TCP or USB/Serial
+- Listens on one MeshCore channel
+- Also listens for direct messages (CONTACT_MSG_RECV)
+- Triggers on "!ai ..." at start or after "NAME: "
+- Channel replies use @[...] prefix
+- DM replies do NOT use @[...]
+- De-dupes duplicate inbound packets
+- Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
+- Splits long replies safely, accounting for numbering/prefix overhead so text is not truncated
 
-Also fixes a race where duplicate inbound packets could invoke the LLM twice by
-locking the dedupe check.
+Env vars (MeshCore transport)
+  MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
+  MESHCORE_HOST                 required if tcp
+  MESHCORE_PORT                 default: 5000
+  MESHCORE_SERIAL_PORT          required if serial, e.g. /dev/ttyACM0
+  MESHCORE_SERIAL_BAUD          default: 115200
+  MESHCORE_CHANNEL_NAME         default: #avl-ai
+  CHANNEL_SCAN_MAX              default: 16
+
+Env vars (Bot)
+  AI_TRIGGER                    default: !ai
+  MAX_REPLY_CHARS               default: 180   # final transmitted message max
+  HISTORY_TURNS                 default: 6
+  DEBUG                         default: 0
+  DEDUPE_WINDOW_S               default: 3.0
+
+Env vars (LLM selection)
+  LLM_BACKEND                   gemini | ollama | openai_compat
+  SYSTEM_PROMPT                 optional
+
+Gemini
+  GEMINI_API_KEY                required if LLM_BACKEND=gemini
+  GEMINI_MODEL                  default: gemini-3-flash-preview
+
+Ollama
+  OLLAMA_BASE_URL               default: http://127.0.0.1:11434
+  OLLAMA_MODEL                  default: llama3.2:latest
+  OLLAMA_KEEP_ALIVE             default: 5m
+
+OpenAI-compatible
+  LOCAL_LLM_BASE_URL            default: http://127.0.0.1:1234/v1
+  LOCAL_LLM_MODEL               default: local-model
+  LOCAL_LLM_API_KEY             optional
+  LOCAL_LLM_TEMPERATURE         default: 0.3
 """
 
 import asyncio
@@ -18,14 +58,17 @@ from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import httpx
-from meshcore import MeshCore, EventType
+from meshcore import EventType, MeshCore
 
-# Gemini optional
 try:
     from google import genai  # type: ignore
 except Exception:
     genai = None  # noqa: N816
 
+
+# ---------------------------
+# helpers
+# ---------------------------
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
@@ -49,24 +92,43 @@ def normalize_channel_name(name: str) -> str:
     return n.strip().lower()
 
 
-def chunk_text(text: str, max_len: int) -> List[str]:
+def chunk_text(text: str, max_len: int, prefix_len: int = 0) -> List[str]:
+    """
+    Split text into chunks that still fit after adding a prefix, such as:
+      '(1/3) '
+      '@[name] '
+      '@[name] (1/3) '
+
+    max_len   = final transmitted message length limit
+    prefix_len = reserved characters for added prefix
+    """
     text = (text or "").strip()
     if not text:
         return []
-    if len(text) <= max_len:
+
+    usable_len = max_len - prefix_len
+    if usable_len <= 0:
+        raise ValueError("max_len must be greater than prefix_len")
+
+    if len(text) <= usable_len:
         return [text]
 
     chunks: List[str] = []
     cur = ""
-    for tok in re.split(r"(\s+)", text):  # keep whitespace
-        if len(cur) + len(tok) <= max_len:
+
+    for tok in re.split(r"(\s+)", text):
+        if not tok:
+            continue
+        if len(cur) + len(tok) <= usable_len:
             cur += tok
         else:
             if cur.strip():
                 chunks.append(cur.strip())
             cur = tok
+
     if cur.strip():
         chunks.append(cur.strip())
+
     return chunks
 
 
@@ -94,7 +156,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 # ---------------------------
-# LLM Clients
+# LLM clients
 # ---------------------------
 
 class LLMClient:
@@ -138,9 +200,13 @@ class OllamaClient(LLMClient):
             r = "assistant" if role == "assistant" else "user"
             messages.append({"role": r, "content": msg})
 
-        payload = {"model": self.model, "messages": messages, "stream": False, "keep_alive": self.keep_alive}
-        url = f"{self.base_url}/api/chat"
-        r = await self._http.post(url, json=payload)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": self.keep_alive,
+        }
+        r = await self._http.post(f"{self.base_url}/api/chat", json=payload)
         r.raise_for_status()
         data = r.json()
         content = (data.get("message") or {}).get("content", "")
@@ -166,7 +232,6 @@ class OpenAICompatClient(LLMClient):
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        url = f"{self.base_url}/chat/completions"
         headers: Dict[str, str] = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -176,8 +241,13 @@ class OpenAICompatClient(LLMClient):
             r = "assistant" if role == "assistant" else "user"
             messages.append({"role": r, "content": msg})
 
-        payload = {"model": self.model, "messages": messages, "temperature": self.temperature}
-        r = await self._http.post(url, headers=headers, json=payload)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+
+        r = await self._http.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         choices = data.get("choices") or []
@@ -224,17 +294,13 @@ class ChannelLLMBot:
             channel_idx: deque(maxlen=history_turns * 2)
         }
 
-        # serialize LLM calls and mesh send bursts
         self._llm_lock = asyncio.Lock()
-
-        # dedupe is separate and must be locked to avoid race duplicates
         self._dedupe_lock = asyncio.Lock()
-        self._seen_ts: Dict[Tuple[str, int, int, str], float] = {}  # (scope, ch, sender_ts, body) -> time
+        self._seen_ts: Dict[Tuple[str, int, int, str], float] = {}
 
-        # Contacts cache for DM replies
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
-        self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
+        self._contacts_by_prefix: Dict[str, str] = {}
 
     # ---------------- Contacts ----------------
 
@@ -242,32 +308,29 @@ class ChannelLLMBot:
         pk = contact.get("public_key")
         if not isinstance(pk, str) or not pk.strip():
             return
+
         pubkey = pk.strip().lower()
-        prefix = pubkey[:12]  # matches your pubkey_prefix length (e.g., '2adad8233a4d')
+        prefix = pubkey[:12]
 
         async with self._contacts_lock:
             self._contacts_by_pubkey[pubkey] = contact
-            # only set prefix if unambiguous or first seen
             self._contacts_by_prefix.setdefault(prefix, pubkey)
 
         if self.debug:
             name = contact.get("name") or contact.get("alias") or ""
-            print(f"[DBG] cached contact pubkey_prefix={prefix} name={name}")
+            print(f"[DBG] cached contact prefix={prefix} name={name}")
 
     async def on_contacts_event(self, ev) -> None:
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
 
-        # payload shapes can vary; try common patterns
         candidates: List[Dict[str, Any]] = []
-
         if isinstance(p.get("contacts"), list):
             for c in p["contacts"]:
                 if isinstance(c, dict):
                     candidates.append(c)
 
-        # sometimes CONTACTS may be a single contact dict
         if "public_key" in p and isinstance(p.get("public_key"), str):
             candidates.append(p)
 
@@ -275,10 +338,6 @@ class ChannelLLMBot:
             await self.upsert_contact(c)
 
     async def refresh_contacts_best_effort(self) -> None:
-        """
-        Tries to request contacts list. This is optional; cache can still populate via
-        NEW_CONTACT/NEXT_CONTACT/CONTACTS events depending on your node behavior.
-        """
         try:
             if hasattr(self.mesh.commands, "get_contacts"):
                 await getattr(self.mesh.commands, "get_contacts")()
@@ -293,10 +352,6 @@ class ChannelLLMBot:
                 print(f"[DBG] refresh_contacts_best_effort error: {e}")
 
     def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Returns a destination dict containing a full 'public_key' that meshcore accepts.
-        """
-        # Best case: payload already includes full public_key
         pk = payload.get("public_key")
         if isinstance(pk, str) and pk.strip():
             return {"public_key": pk.strip()}
@@ -306,11 +361,7 @@ class ChannelLLMBot:
             return None
         prefix = prefix.strip().lower()
 
-        pubkey: Optional[str] = None
-        # Fast path via prefix map
         pubkey = self._contacts_by_prefix.get(prefix)
-
-        # If not found, try slow search across cached pubkeys (in case prefix length differs)
         if not pubkey:
             for pk2 in self._contacts_by_pubkey.keys():
                 if pk2.startswith(prefix):
@@ -342,14 +393,13 @@ class ChannelLLMBot:
         idx = b.lower().find(self.trigger.lower())
         if idx < 0:
             return ""
-        return b[idx + len(self.trigger) :].strip(" \t:,-")
+        return b[idx + len(self.trigger):].strip(" \t:,-")
 
     async def dedupe_drop(self, scope: str, ch_idx: int, sender_ts: int, body: str) -> bool:
         key = (scope, ch_idx, sender_ts, body)
         now = time.time()
 
         async with self._dedupe_lock:
-            # purge old
             for k, t0 in list(self._seen_ts.items()):
                 if now - t0 > self.dedupe_window_s:
                     self._seen_ts.pop(k, None)
@@ -366,14 +416,33 @@ class ChannelLLMBot:
         hist = list(self.history[self.channel_idx])
         return hist + [("user", user_text)]
 
-    def format_chan_reply(self, sender: str, msg: str) -> str:
-        msg = (msg or "").strip()
-        if not msg:
-            return ""
-        return f"@[{sender}] {msg}" if sender else msg
+    def build_channel_messages(self, sender: str, answer: str) -> List[str]:
+        sender_prefix = f"@[{sender}] " if sender else ""
 
-    def format_dm_reply(self, msg: str) -> str:
-        return (msg or "").strip()
+        # First pass with conservative numbering width
+        parts = chunk_text(answer, self.max_reply_chars, prefix_len=len(sender_prefix) + 6)
+
+        if len(parts) > 1:
+            num_prefix_len = len(f"({len(parts)}/{len(parts)}) ")
+            parts = chunk_text(answer, self.max_reply_chars, prefix_len=len(sender_prefix) + num_prefix_len)
+
+        out: List[str] = []
+        for i, part in enumerate(parts, start=1):
+            body = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+            out.append(f"{sender_prefix}{body}" if sender_prefix else body)
+        return out
+
+    def build_dm_messages(self, answer: str) -> List[str]:
+        parts = chunk_text(answer, self.max_reply_chars, prefix_len=6)
+
+        if len(parts) > 1:
+            num_prefix_len = len(f"({len(parts)}/{len(parts)}) ")
+            parts = chunk_text(answer, self.max_reply_chars, prefix_len=num_prefix_len)
+
+        out: List[str] = []
+        for i, part in enumerate(parts, start=1):
+            out.append(part if len(parts) == 1 else f"({i}/{len(parts)}) {part}")
+        return out
 
     # ---------------- Event handlers ----------------
 
@@ -405,8 +474,7 @@ class ChannelLLMBot:
 
         async with self._llm_lock:
             if user.lower() == "ping":
-                out = self.format_chan_reply(sender, "pong")
-                if out:
+                for out in self.build_channel_messages(sender, "pong"):
                     await self.mesh.commands.send_chan_msg(self.channel_idx, out)
                 return
 
@@ -420,12 +488,8 @@ class ChannelLLMBot:
 
             self.history[self.channel_idx].append(("assistant", answer))
 
-            parts = chunk_text(answer, self.max_reply_chars)
-            for i, part in enumerate(parts, start=1):
-                msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                out = self.format_chan_reply(sender, msg)
-                if out:
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+            for out in self.build_channel_messages(sender, answer):
+                await self.mesh.commands.send_chan_msg(self.channel_idx, out)
 
     async def on_dm_msg(self, ev) -> None:
         p = ev.payload or {}
@@ -452,10 +516,8 @@ class ChannelLLMBot:
         if not user:
             return
 
-        # Resolve destination: needs full public_key
         dst = self.resolve_dm_dst(p)
         if dst is None:
-            # attempt refresh once then try again
             await self.refresh_contacts_best_effort()
             dst = self.resolve_dm_dst(p)
 
@@ -466,8 +528,7 @@ class ChannelLLMBot:
 
         async with self._llm_lock:
             if user.lower() == "ping":
-                out = self.format_dm_reply("pong")
-                if out:
+                for out in self.build_dm_messages("pong"):
                     await self.mesh.commands.send_msg(dst, out)
                 return
 
@@ -477,13 +538,13 @@ class ChannelLLMBot:
             except Exception as e:
                 answer = f"LLM error: {e}"
 
-            parts = chunk_text(answer, self.max_reply_chars)
-            for i, part in enumerate(parts, start=1):
-                msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                out = self.format_dm_reply(msg)
-                if out:
-                    await self.mesh.commands.send_msg(dst, out)
+            for out in self.build_dm_messages(answer):
+                await self.mesh.commands.send_msg(dst, out)
 
+
+# ---------------------------
+# connection
+# ---------------------------
 
 async def create_mesh_connection() -> MeshCore:
     transport = env_str("MESHCORE_TRANSPORT", "tcp").strip().lower()
@@ -516,6 +577,10 @@ async def create_mesh_connection() -> MeshCore:
 
     raise SystemExit("MESHCORE_TRANSPORT must be one of: tcp | serial")
 
+
+# ---------------------------
+# main
+# ---------------------------
 
 async def main() -> None:
     channel_name = env_str("MESHCORE_CHANNEL_NAME", "#avl-ai")
@@ -578,16 +643,13 @@ async def main() -> None:
         system_prompt=system_prompt,
     )
 
-    # Contacts/cache feeders
     mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
     mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
     mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
 
-    # Message listeners
     mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
     mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
 
-    # Try to warm contacts cache
     await bot.refresh_contacts_best_effort()
 
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
