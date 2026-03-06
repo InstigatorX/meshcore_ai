@@ -12,7 +12,8 @@ Features
 - DM replies do NOT use @[...]
 - De-dupes duplicate inbound packets
 - Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
-- Splits long replies safely, accounting for numbering/prefix overhead so text is not truncated
+- Splits long replies safely by UTF-8 BYTES (not chars), accounting for numbering/prefix overhead
+  so MeshCore does not truncate messages mid-word.
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -25,7 +26,7 @@ Env vars (MeshCore transport)
 
 Env vars (Bot)
   AI_TRIGGER                    default: !ai
-  MAX_REPLY_CHARS               default: 180   # final transmitted message max
+  MAX_REPLY_CHARS               default: 180   # max BYTES of final transmitted message (UTF-8)
   HISTORY_TURNS                 default: 6
   DEBUG                         default: 0
   DEDUPE_WINDOW_S               default: 3.0
@@ -92,38 +93,63 @@ def normalize_channel_name(name: str) -> str:
     return n.strip().lower()
 
 
-def chunk_text(text: str, max_len: int, prefix_len: int = 0) -> List[str]:
-    """
-    Split text into chunks that still fit after adding a prefix, such as:
-      '(1/3) '
-      '@[name] '
-      '@[name] (1/3) '
+def utf8_len(text: str) -> int:
+    return len((text or "").encode("utf-8"))
 
-    max_len   = final transmitted message length limit
-    prefix_len = reserved characters for added prefix
+
+def chunk_text_bytes(text: str, max_bytes: int, prefix: str = "") -> List[str]:
+    """
+    Split `text` so that (prefix + chunk) fits within `max_bytes` in UTF-8 BYTES.
+
+    This avoids MeshCore truncation when a message exceeds a byte-limit even if
+    Python character counts look "safe".
+
+    If a single token is too large, it will be hard-split by bytes.
     """
     text = (text or "").strip()
+    prefix = prefix or ""
+
     if not text:
         return []
 
-    usable_len = max_len - prefix_len
-    if usable_len <= 0:
-        raise ValueError("max_len must be greater than prefix_len")
+    prefix_bytes = utf8_len(prefix)
+    if prefix_bytes >= max_bytes:
+        raise ValueError("Prefix is too large for max_bytes")
 
-    if len(text) <= usable_len:
+    usable_bytes = max_bytes - prefix_bytes
+
+    if utf8_len(text) <= usable_bytes:
         return [text]
 
     chunks: List[str] = []
     cur = ""
 
+    # keep whitespace tokens so we can pack nicely
     for tok in re.split(r"(\s+)", text):
         if not tok:
             continue
-        if len(cur) + len(tok) <= usable_len:
-            cur += tok
+
+        candidate = cur + tok
+        if utf8_len(candidate) <= usable_bytes:
+            cur = candidate
+            continue
+
+        if cur.strip():
+            chunks.append(cur.strip())
+
+        # token itself might be too large; hard split by bytes
+        tok_stripped = tok.strip()
+        if tok_stripped and utf8_len(tok_stripped) > usable_bytes:
+            piece = ""
+            for ch in tok_stripped:
+                if utf8_len(piece + ch) <= usable_bytes:
+                    piece += ch
+                else:
+                    if piece:
+                        chunks.append(piece)
+                    piece = ch
+            cur = piece
         else:
-            if cur.strip():
-                chunks.append(cur.strip())
             cur = tok
 
     if cur.strip():
@@ -272,7 +298,7 @@ class ChannelLLMBot:
         channel_idx: int,
         channel_label: str,
         trigger: str,
-        max_reply_chars: int,
+        max_reply_chars: int,  # bytes budget
         history_turns: int,
         dedupe_window_s: float,
         debug: bool,
@@ -419,29 +445,60 @@ class ChannelLLMBot:
     def build_channel_messages(self, sender: str, answer: str) -> List[str]:
         sender_prefix = f"@[{sender}] " if sender else ""
 
-        # First pass with conservative numbering width
-        parts = chunk_text(answer, self.max_reply_chars, prefix_len=len(sender_prefix) + 6)
+        # 1) conservative first pass to estimate count with a wide numbering prefix
+        parts = chunk_text_bytes(
+            answer,
+            self.max_reply_chars,
+            prefix=sender_prefix + "(99/99) ",
+        )
 
+        # 2) rebuild with the true numbering width once we know how many parts
         if len(parts) > 1:
-            num_prefix_len = len(f"({len(parts)}/{len(parts)}) ")
-            parts = chunk_text(answer, self.max_reply_chars, prefix_len=len(sender_prefix) + num_prefix_len)
+            numbering = f"({len(parts)}/{len(parts)}) "
+            parts = chunk_text_bytes(
+                answer,
+                self.max_reply_chars,
+                prefix=sender_prefix + numbering,
+            )
 
         out: List[str] = []
         for i, part in enumerate(parts, start=1):
             body = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
             out.append(f"{sender_prefix}{body}" if sender_prefix else body)
+
+        # sanity (debug): ensure we never exceed max bytes
+        if self.debug:
+            for m in out:
+                if utf8_len(m) > self.max_reply_chars:
+                    print(f"[DBG] WARN: built channel msg exceeds max bytes: {utf8_len(m)} > {self.max_reply_chars}")
+
         return out
 
     def build_dm_messages(self, answer: str) -> List[str]:
-        parts = chunk_text(answer, self.max_reply_chars, prefix_len=6)
+        # DM has no @[...] prefix, but may have numbering prefix
+        parts = chunk_text_bytes(
+            answer,
+            self.max_reply_chars,
+            prefix="(99/99) ",
+        )
 
         if len(parts) > 1:
-            num_prefix_len = len(f"({len(parts)}/{len(parts)}) ")
-            parts = chunk_text(answer, self.max_reply_chars, prefix_len=num_prefix_len)
+            numbering = f"({len(parts)}/{len(parts)}) "
+            parts = chunk_text_bytes(
+                answer,
+                self.max_reply_chars,
+                prefix=numbering,
+            )
 
         out: List[str] = []
         for i, part in enumerate(parts, start=1):
             out.append(part if len(parts) == 1 else f"({i}/{len(parts)}) {part}")
+
+        if self.debug:
+            for m in out:
+                if utf8_len(m) > self.max_reply_chars:
+                    print(f"[DBG] WARN: built DM msg exceeds max bytes: {utf8_len(m)} > {self.max_reply_chars}")
+
         return out
 
     # ---------------- Event handlers ----------------
@@ -587,7 +644,7 @@ async def main() -> None:
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
-    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
+    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)  # treated as max UTF-8 bytes budget
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
     debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
