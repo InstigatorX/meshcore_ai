@@ -12,8 +12,8 @@ Features
 - DM replies do NOT use @[...]
 - De-dupes duplicate inbound packets
 - Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
-- Splits long replies safely by UTF-8 BYTES (not chars), accounting for numbering/prefix overhead
-  so MeshCore does not truncate messages mid-word.
+- Splits long replies safely, accounting for numbering/prefix overhead so text is not truncated
+- Adds lightweight sender/request metadata into the LLM system prompt (SNR, path_len, sender name/prefix, etc.)
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -25,8 +25,8 @@ Env vars (MeshCore transport)
   CHANNEL_SCAN_MAX              default: 16
 
 Env vars (Bot)
-  AI_TRIGGER                    default: !ai
-  MAX_REPLY_CHARS               default: 180   # max BYTES of final transmitted message (UTF-8)
+  AI_TRIGGER                    default: !ai   (bash: export AI_TRIGGER='!ai')
+  MAX_REPLY_CHARS               default: 180   # final transmitted message max
   HISTORY_TURNS                 default: 6
   DEBUG                         default: 0
   DEDUPE_WINDOW_S               default: 3.0
@@ -34,6 +34,7 @@ Env vars (Bot)
 Env vars (LLM selection)
   LLM_BACKEND                   gemini | ollama | openai_compat
   SYSTEM_PROMPT                 optional
+  INCLUDE_REQUESTER_CONTEXT     default: 1     # set 0 to disable sender metadata injection
 
 Gemini
   GEMINI_API_KEY                required if LLM_BACKEND=gemini
@@ -61,6 +62,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import httpx
 from meshcore import EventType, MeshCore
 
+# Gemini is optional
 try:
     from google import genai  # type: ignore
 except Exception:
@@ -86,6 +88,13 @@ def env_str(name: str, default: str) -> str:
     return default if not v else v
 
 
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+
 def normalize_channel_name(name: str) -> str:
     n = (name or "").strip()
     if n.startswith("#"):
@@ -93,69 +102,110 @@ def normalize_channel_name(name: str) -> str:
     return n.strip().lower()
 
 
-def utf8_len(text: str) -> int:
-    return len((text or "").encode("utf-8"))
-
-
-def chunk_text_bytes(text: str, max_bytes: int, prefix: str = "") -> List[str]:
+def _split_with_budget(text: str, budget: int) -> List[str]:
     """
-    Split `text` so that (prefix + chunk) fits within `max_bytes` in UTF-8 BYTES.
-
-    This avoids MeshCore truncation when a message exceeds a byte-limit even if
-    Python character counts look "safe".
-
-    If a single token is too large, it will be hard-split by bytes.
+    Split with a strict char budget. Preserves whitespace tokens so we don't cut words.
     """
     text = (text or "").strip()
-    prefix = prefix or ""
-
     if not text:
         return []
+    if budget <= 0:
+        raise ValueError("budget must be > 0")
 
-    prefix_bytes = utf8_len(prefix)
-    if prefix_bytes >= max_bytes:
-        raise ValueError("Prefix is too large for max_bytes")
-
-    usable_bytes = max_bytes - prefix_bytes
-
-    if utf8_len(text) <= usable_bytes:
+    if len(text) <= budget:
         return [text]
 
     chunks: List[str] = []
     cur = ""
-
-    # keep whitespace tokens so we can pack nicely
     for tok in re.split(r"(\s+)", text):
         if not tok:
             continue
-
-        candidate = cur + tok
-        if utf8_len(candidate) <= usable_bytes:
-            cur = candidate
-            continue
-
-        if cur.strip():
-            chunks.append(cur.strip())
-
-        # token itself might be too large; hard split by bytes
-        tok_stripped = tok.strip()
-        if tok_stripped and utf8_len(tok_stripped) > usable_bytes:
-            piece = ""
-            for ch in tok_stripped:
-                if utf8_len(piece + ch) <= usable_bytes:
-                    piece += ch
-                else:
-                    if piece:
-                        chunks.append(piece)
-                    piece = ch
-            cur = piece
+        if len(cur) + len(tok) <= budget:
+            cur += tok
         else:
+            if cur.strip():
+                chunks.append(cur.strip())
             cur = tok
-
     if cur.strip():
         chunks.append(cur.strip())
-
     return chunks
+
+
+def chunk_text(text: str, max_len: int, prefix_len: int = 0) -> List[str]:
+    """
+    Split text into chunks that still fit after adding a prefix.
+
+    max_len    = final transmitted message max length
+    prefix_len = reserved characters for prefix added by caller
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    budget = max_len - prefix_len
+    if budget <= 0:
+        raise ValueError("max_len must be greater than prefix_len")
+
+    return _split_with_budget(text, budget)
+
+
+def _build_number_prefix(i: int, n: int) -> str:
+    return f"({i}/{n}) " if n > 1 else ""
+
+
+def split_for_transport(
+    text: str,
+    max_len: int,
+    fixed_prefix: str = "",
+    number_parts: bool = True,
+) -> List[str]:
+    """
+    Robust splitter that guarantees no truncation after adding:
+      fixed_prefix + optional "(i/n) " prefix
+
+    This avoids the classic bug where you chunk the raw answer, then add "(i/n) "
+    and overflow the mesh message length, causing *silent truncation* and missing text.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    fixed_len = len(fixed_prefix)
+
+    # Fast path: no numbering needed if it fits as-is.
+    if fixed_len + len(text) <= max_len:
+        return [f"{fixed_prefix}{text}"]
+
+    # If numbering disabled, just chunk with fixed prefix budget.
+    if not number_parts:
+        parts = chunk_text(text, max_len=max_len, prefix_len=fixed_len)
+        return [f"{fixed_prefix}{p}" for p in parts]
+
+    # We don't know n (number of parts) upfront because numbering itself adds overhead.
+    # Iterate until stable.
+    n_guess = max(2, (fixed_len + len(text) + max_len - 1) // max_len)
+    n_guess = min(max(n_guess, 2), 999)  # sanity
+
+    while True:
+        # worst-case numbering prefix length for this n_guess:
+        # e.g., "(12/12) " => len depends on digits of n
+        num_len = len(_build_number_prefix(n_guess, n_guess))
+        parts = chunk_text(text, max_len=max_len, prefix_len=fixed_len + num_len)
+
+        n = len(parts)
+        if n == n_guess:
+            break
+        n_guess = n
+
+    out: List[str] = []
+    for i, part in enumerate(parts, start=1):
+        np = _build_number_prefix(i, n)
+        out.append(f"{fixed_prefix}{np}{part}")
+        # Safety assert: never exceed max_len
+        if len(out[-1]) > max_len:
+            # As a last resort, hard trim (shouldn't happen)
+            out[-1] = out[-1][:max_len]
+    return out
 
 
 async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: int = 16) -> int:
@@ -298,11 +348,12 @@ class ChannelLLMBot:
         channel_idx: int,
         channel_label: str,
         trigger: str,
-        max_reply_chars: int,  # bytes budget
+        max_reply_chars: int,
         history_turns: int,
         dedupe_window_s: float,
         debug: bool,
         system_prompt: str,
+        include_requester_context: bool,
     ):
         self.mesh = mesh
         self.llm = llm
@@ -313,6 +364,7 @@ class ChannelLLMBot:
         self.debug = debug
         self.dedupe_window_s = dedupe_window_s
         self.system_prompt = system_prompt
+        self.include_requester_context = include_requester_context
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
@@ -377,7 +429,8 @@ class ChannelLLMBot:
             if self.debug:
                 print(f"[DBG] refresh_contacts_best_effort error: {e}")
 
-    def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # If the payload already contains full public_key, use it.
         pk = payload.get("public_key")
         if isinstance(pk, str) and pk.strip():
             return {"public_key": pk.strip()}
@@ -387,17 +440,70 @@ class ChannelLLMBot:
             return None
         prefix = prefix.strip().lower()
 
-        pubkey = self._contacts_by_prefix.get(prefix)
-        if not pubkey:
-            for pk2 in self._contacts_by_pubkey.keys():
-                if pk2.startswith(prefix):
-                    pubkey = pk2
-                    break
+        async with self._contacts_lock:
+            pubkey = self._contacts_by_prefix.get(prefix)
+            if not pubkey:
+                for pk2 in self._contacts_by_pubkey.keys():
+                    if pk2.startswith(prefix):
+                        pubkey = pk2
+                        break
 
         if not pubkey:
             return None
-
         return {"public_key": pubkey}
+
+    # ---------------- Requester context ----------------
+
+    def build_requester_context(
+        self,
+        scope: str,
+        payload: Dict[str, Any],
+        sender_name: str = "",
+    ) -> str:
+        """
+        Lightweight metadata injected into the system prompt so the model has
+        context about link conditions and who/where the request came from.
+        """
+        if not self.include_requester_context:
+            return ""
+
+        lines: List[str] = ["Requester context:"]
+
+        lines.append(f"- scope: {'direct_message' if scope == 'dm' else 'channel_message'}")
+
+        if scope == "chan":
+            lines.append(f"- channel_name: {self.channel_label}")
+            lines.append(f"- channel_idx: {self.channel_idx}")
+
+        if sender_name:
+            lines.append(f"- sender_name: {sender_name}")
+
+        pubkey_prefix = payload.get("pubkey_prefix")
+        if isinstance(pubkey_prefix, str) and pubkey_prefix:
+            lines.append(f"- sender_pubkey_prefix: {pubkey_prefix}")
+
+        snr = payload.get("SNR")
+        if isinstance(snr, (int, float)):
+            lines.append(f"- snr: {snr}")
+
+        path_len = payload.get("path_len")
+        if isinstance(path_len, int):
+            lines.append(f"- path_len: {path_len}")
+
+        sender_ts = payload.get("sender_timestamp")
+        if isinstance(sender_ts, int):
+            lines.append(f"- sender_timestamp: {sender_ts}")
+
+        txt_type = payload.get("txt_type")
+        if isinstance(txt_type, int):
+            lines.append(f"- txt_type: {txt_type}")
+
+        return "\n".join(lines)
+
+    def effective_system_prompt(self, requester_context: str) -> str:
+        if requester_context:
+            return f"{self.system_prompt}\n\n{requester_context}"
+        return self.system_prompt
 
     # ---------------- Helpers ----------------
 
@@ -443,63 +549,22 @@ class ChannelLLMBot:
         return hist + [("user", user_text)]
 
     def build_channel_messages(self, sender: str, answer: str) -> List[str]:
-        sender_prefix = f"@[{sender}] " if sender else ""
-
-        # 1) conservative first pass to estimate count with a wide numbering prefix
-        parts = chunk_text_bytes(
-            answer,
-            self.max_reply_chars,
-            prefix=sender_prefix + "(99/99) ",
+        fixed_prefix = f"@[{sender}] " if sender else ""
+        return split_for_transport(
+            text=answer,
+            max_len=self.max_reply_chars,
+            fixed_prefix=fixed_prefix,
+            number_parts=True,
         )
-
-        # 2) rebuild with the true numbering width once we know how many parts
-        if len(parts) > 1:
-            numbering = f"({len(parts)}/{len(parts)}) "
-            parts = chunk_text_bytes(
-                answer,
-                self.max_reply_chars,
-                prefix=sender_prefix + numbering,
-            )
-
-        out: List[str] = []
-        for i, part in enumerate(parts, start=1):
-            body = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-            out.append(f"{sender_prefix}{body}" if sender_prefix else body)
-
-        # sanity (debug): ensure we never exceed max bytes
-        if self.debug:
-            for m in out:
-                if utf8_len(m) > self.max_reply_chars:
-                    print(f"[DBG] WARN: built channel msg exceeds max bytes: {utf8_len(m)} > {self.max_reply_chars}")
-
-        return out
 
     def build_dm_messages(self, answer: str) -> List[str]:
-        # DM has no @[...] prefix, but may have numbering prefix
-        parts = chunk_text_bytes(
-            answer,
-            self.max_reply_chars,
-            prefix="(99/99) ",
+        # No @[...] prefix in DMs
+        return split_for_transport(
+            text=answer,
+            max_len=self.max_reply_chars,
+            fixed_prefix="",
+            number_parts=True,
         )
-
-        if len(parts) > 1:
-            numbering = f"({len(parts)}/{len(parts)}) "
-            parts = chunk_text_bytes(
-                answer,
-                self.max_reply_chars,
-                prefix=numbering,
-            )
-
-        out: List[str] = []
-        for i, part in enumerate(parts, start=1):
-            out.append(part if len(parts) == 1 else f"({i}/{len(parts)}) {part}")
-
-        if self.debug:
-            for m in out:
-                if utf8_len(m) > self.max_reply_chars:
-                    print(f"[DBG] WARN: built DM msg exceeds max bytes: {utf8_len(m)} > {self.max_reply_chars}")
-
-        return out
 
     # ---------------- Event handlers ----------------
 
@@ -538,8 +603,11 @@ class ChannelLLMBot:
             self.history[self.channel_idx].append(("user", user))
             conversation = self.build_conversation(user)
 
+            requester_ctx = self.build_requester_context("chan", p, sender_name=sender)
+            sys_prompt = self.effective_system_prompt(requester_ctx)
+
             try:
-                answer = await self.llm.generate(self.system_prompt, conversation)
+                answer = await self.llm.generate(sys_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
 
@@ -573,10 +641,10 @@ class ChannelLLMBot:
         if not user:
             return
 
-        dst = self.resolve_dm_dst(p)
+        dst = await self.resolve_dm_dst(p)
         if dst is None:
             await self.refresh_contacts_best_effort()
-            dst = self.resolve_dm_dst(p)
+            dst = await self.resolve_dm_dst(p)
 
         if dst is None:
             if self.debug:
@@ -590,8 +658,12 @@ class ChannelLLMBot:
                 return
 
             conversation = self.build_conversation(user)
+
+            requester_ctx = self.build_requester_context("dm", p, sender_name=sender)
+            sys_prompt = self.effective_system_prompt(requester_ctx)
+
             try:
-                answer = await self.llm.generate(self.system_prompt, conversation)
+                answer = await self.llm.generate(sys_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
 
@@ -644,11 +716,12 @@ async def main() -> None:
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
-    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)  # treated as max UTF-8 bytes budget
+    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
-    debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
+    debug = env_bool("DEBUG", False)
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+    include_requester_context = env_bool("INCLUDE_REQUESTER_CONTEXT", True)
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
@@ -698,6 +771,7 @@ async def main() -> None:
         dedupe_window_s=dedupe_window_s,
         debug=debug,
         system_prompt=system_prompt,
+        include_requester_context=include_requester_context,
     )
 
     mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
@@ -725,10 +799,11 @@ async def main() -> None:
             f"url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}"
         )
 
+    print(f"[CTX] INCLUDE_REQUESTER_CONTEXT={1 if include_requester_context else 0}")
     print(f"[TEST] Channel: '{trigger} ping' or 'NAME: {trigger} ping' (expect: @NAME pong)")
     print(f"[TEST] DM: '{trigger} ping' or 'NAME: {trigger} ping' (expect: pong)")
 
-    await asyncio.sleep(float("inf"))
+    await asyncio.sleep(float('inf'))
 
 
 if __name__ == "__main__":
