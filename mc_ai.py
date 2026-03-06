@@ -711,7 +711,7 @@ async def create_mesh_connection() -> MeshCore:
 # main
 # ---------------------------
 
-async def main() -> None:
+async def run_bot_once() -> None:
     channel_name = env_str("MESHCORE_CHANNEL_NAME", "#avl-ai")
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
@@ -777,7 +777,6 @@ async def main() -> None:
     mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
     mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
     mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
-
     mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
     mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
 
@@ -786,25 +785,31 @@ async def main() -> None:
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
     print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
     print(f"[LLM] backend={backend}")
-    if backend == "gemini":
-        print(f"[LLM] model={env_str('GEMINI_MODEL', 'gemini-3-flash-preview')}")
-    elif backend == "ollama":
-        print(
-            f"[LLM] model={env_str('OLLAMA_MODEL', 'llama3.2:latest')} "
-            f"url={env_str('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')}"
-        )
-    else:
-        print(
-            f"[LLM] model={env_str('LOCAL_LLM_MODEL', 'local-model')} "
-            f"url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}"
-        )
-
     print(f"[CTX] INCLUDE_REQUESTER_CONTEXT={1 if include_requester_context else 0}")
-    print(f"[TEST] Channel: '{trigger} ping' or 'NAME: {trigger} ping' (expect: @NAME pong)")
-    print(f"[TEST] DM: '{trigger} ping' or 'NAME: {trigger} ping' (expect: pong)")
 
-    await asyncio.sleep(float('inf'))
+    disconnect_waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
+    async def disconnected_handler(ev) -> None:
+        print("[WARN] MeshCore disconnected")
+        if not disconnect_waiter.done():
+            disconnect_waiter.set_exception(ConnectionError("MeshCore disconnected"))
+
+    mesh.subscribe(EventType.DISCONNECTED, disconnected_handler)
+
+    await disconnect_waiter
+
+async def main() -> None:
+    reconnect_delay = env_int("RECONNECT_DELAY_S", 5)
+
+    while True:
+        try:
+            await run_bot_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[WARN] bot session ended: {e}")
+            print(f"[INFO] reconnecting in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
 
 if __name__ == "__main__":
     asyncio.run(main())
