@@ -15,6 +15,9 @@ Features
 - Adds in-flight dedupe to prevent duplicate LLM calls
 - Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
 - Splits long replies safely, accounting for numbering/prefix overhead
+- **OPTIMIZED:** Handles concurrent LLM requests for better responsiveness.
+- **OPTIMIZED:** Persistent LLM client across mesh reconnections.
+- **OPTIMIZED:** More robust message splitting logic.
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -65,10 +68,11 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import httpx
 from meshcore import EventType, MeshCore
 
+# Check for google-genai library
 try:
-    from google import genai  # type: ignore
-except Exception:
-    genai = None  # noqa: N816
+    import google.genai as genai
+except ImportError:
+    genai = None
 
 
 # ---------------------------
@@ -105,28 +109,47 @@ def normalize_channel_name(name: str) -> str:
 
 
 def _split_with_budget(text: str, budget: int) -> List[str]:
+    """
+    Splits text into chunks that fit within the budget.
+    Handles long words by hard-splitting them if necessary.
+    Correctly accounts for spaces between words.
+    """
     text = (text or "").strip()
     if not text:
         return []
     if budget <= 0:
         raise ValueError("budget must be > 0")
 
-    if len(text) <= budget:
-        return [text]
-
+    words = text.split(' ')
     chunks: List[str] = []
-    cur = ""
-    for tok in re.split(r"(\s+)", text):
-        if not tok:
+    current_chunk = ""
+
+    for word in words:
+        if not word:
             continue
-        if len(cur) + len(tok) <= budget:
-            cur += tok
+        
+        # If a single word is longer than the budget, it must be split
+        if len(word) > budget:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            # Hard split the long word
+            for i in range(0, len(word), budget):
+                chunks.append(word[i:i+budget])
+        # If adding the next word exceeds the budget, push current chunk
+        elif len(current_chunk) + len(word) + (1 if current_chunk else 0) > budget:
+            chunks.append(current_chunk)
+            current_chunk = word
+        # Otherwise, add the word to the current chunk
         else:
-            if cur.strip():
-                chunks.append(cur.strip())
-            cur = tok
-    if cur.strip():
-        chunks.append(cur.strip())
+            if current_chunk:
+                current_chunk += " " + word
+            else:
+                current_chunk = word
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    
     return chunks
 
 
@@ -185,6 +208,8 @@ def split_for_transport(
         np = _build_number_prefix(i, n)
         msg = f"{fixed_prefix}{np}{part}"
         if len(msg) > max_len:
+            # This should theoretically not happen with correct splitting logic,
+            # but as a safety measure, truncate.
             msg = msg[:max_len]
         out.append(msg)
     return out
@@ -233,13 +258,15 @@ class GeminiClient(LLMClient):
         self.client = genai.Client(api_key=api_key)
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        prompt_lines = [system_prompt, "", "Conversation:"]
+        # Construct prompt more efficiently
+        prompt_parts = [system_prompt, "\nConversation:"]
         for role, msg in conversation:
-            prompt_lines.append(f"{role}: {msg}")
-        prompt_lines.append("assistant:")
-        prompt = "\n".join(prompt_lines)
+            prompt_parts.append(f"{role}: {msg}")
+        prompt_parts.append("assistant:")
+        prompt = "\n".join(prompt_parts)
 
         def _call() -> str:
+            # This is a blocking call, so we run it in a separate thread
             resp = self.client.models.generate_content(model=self.model, contents=prompt)
             txt = getattr(resp, "text", None)
             return str(txt).strip() if txt else ""
@@ -258,6 +285,7 @@ class OllamaClient(LLMClient):
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         messages = [{"role": "system", "content": system_prompt}]
         for role, msg in conversation:
+            # Map 'assistant' and 'user' to standard roles
             r = "assistant" if role == "assistant" else "user"
             messages.append({"role": r, "content": msg})
 
@@ -357,11 +385,13 @@ class ChannelLLMBot:
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
+        # History is shared state accessed by concurrent message handlers.
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
             channel_idx: deque(maxlen=history_turns * 2)
         }
+        # Lock to protect access to self.history
+        self._history_lock = asyncio.Lock()
 
-        self._llm_lock = asyncio.Lock()
         self._dedupe_lock = asyncio.Lock()
         self._seen_ts: Dict[Tuple[str, int, int, str], float] = {}
         self._inflight: Dict[Tuple[str, int, int, str], float] = {}
@@ -415,6 +445,7 @@ class ChannelLLMBot:
 
     async def refresh_contacts_best_effort(self) -> None:
         try:
+            # Try different methods depending on meshcore version
             if hasattr(self.mesh.commands, "get_contacts"):
                 await getattr(self.mesh.commands, "get_contacts")()
                 return
@@ -474,21 +505,10 @@ class ChannelLLMBot:
         if isinstance(pubkey_prefix, str) and pubkey_prefix:
             lines.append(f"- sender_pubkey_prefix: {pubkey_prefix}")
 
-        snr = payload.get("SNR")
-        if isinstance(snr, (int, float)):
-            lines.append(f"- snr: {snr}")
-
-        path_len = payload.get("path_len")
-        if isinstance(path_len, int):
-            lines.append(f"- path_len: {path_len}")
-
-        sender_ts = payload.get("sender_timestamp")
-        if isinstance(sender_ts, int):
-            lines.append(f"- sender_timestamp: {sender_ts}")
-
-        txt_type = payload.get("txt_type")
-        if isinstance(txt_type, int):
-            lines.append(f"- txt_type: {txt_type}")
+        for field in ["SNR", "path_len", "sender_timestamp", "txt_type"]:
+            val = payload.get(field)
+            if isinstance(val, (int, float)):
+                 lines.append(f"- {field.lower()}: {val}")
 
         return "\n".join(lines)
 
@@ -524,12 +544,13 @@ class ChannelLLMBot:
         now = time.time()
 
         async with self._dedupe_lock:
+            # Lazy cleanup of old entries
             for k, t0 in list(self._seen_ts.items()):
                 if now - t0 > self.dedupe_window_s:
                     self._seen_ts.pop(k, None)
 
             for k, t0 in list(self._inflight.items()):
-                if now - t0 > max(self.dedupe_window_s, 30.0):
+                if now - t0 > max(self.dedupe_window_s, 30.0): # Longer timeout for inflight
                     self._inflight.pop(k, None)
 
             if key in self._seen_ts:
@@ -550,9 +571,16 @@ class ChannelLLMBot:
             self._inflight.pop(key, None)
             self._seen_ts[key] = time.time()
 
-    def build_conversation(self, user_text: str) -> List[Tuple[str, str]]:
-        hist = list(self.history[self.channel_idx])
-        return hist + [("user", user_text)]
+    # Note: This method is now async because it needs to acquire the lock.
+    async def get_conversation_snapshot(self, channel_idx: int) -> List[Tuple[str, str]]:
+        async with self._history_lock:
+            # Return a copy of the current history
+            return list(self.history[channel_idx])
+
+    async def append_to_history(self, channel_idx: int, user_msg: str, assistant_msg: str) -> None:
+        async with self._history_lock:
+            self.history[channel_idx].append(("user", user_msg))
+            self.history[channel_idx].append(("assistant", assistant_msg))
 
     def build_channel_messages(self, sender: str, answer: str) -> List[str]:
         fixed_prefix = f"@[{sender}] " if sender else ""
@@ -590,10 +618,12 @@ class ChannelLLMBot:
             return
 
         sender, body = self.split_sender_and_body(text)
+        # Use a default timestamp if missing to avoid dedupe issues
         sender_ts = p.get("sender_timestamp")
         if not isinstance(sender_ts, int):
             sender_ts = -1
 
+        # 1. Deduplication (fast, locked)
         dedupe_key = await self.dedupe_enter("chan", self.channel_idx, sender_ts, body)
         if dedupe_key is None:
             return
@@ -602,32 +632,40 @@ class ChannelLLMBot:
             if self.debug:
                 print(f"[DBG] target-channel msg payload={p} bot_id={id(self)} gen={self.generation}")
 
-            user = self.extract_after_trigger(body)
-            if not user:
+            user_msg = self.extract_after_trigger(body)
+            if not user_msg:
+                return
+            
+            if user_msg.lower() == "ping":
+                for out in self.build_channel_messages(sender, "pong"):
+                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
                 return
 
-            async with self._llm_lock:
-                if user.lower() == "ping":
-                    for out in self.build_channel_messages(sender, "pong"):
-                        await self.mesh.commands.send_chan_msg(self.channel_idx, out)
-                    return
+            # 2. Prepare context and prompt (fast, unlocked)
+            # Get a snapshot of history to build the prompt.
+            hist_snapshot = await self.get_conversation_snapshot(self.channel_idx)
+            conversation = hist_snapshot + [("user", user_msg)]
 
-                self.history[self.channel_idx].append(("user", user))
-                conversation = self.build_conversation(user)
+            requester_ctx = self.build_requester_context("chan", p, sender_name=sender)
+            sys_prompt = self.effective_system_prompt(requester_ctx)
 
-                requester_ctx = self.build_requester_context("chan", p, sender_name=sender)
-                sys_prompt = self.effective_system_prompt(requester_ctx)
+            # 3. Call LLM (SLOW, UNLOCKED)
+            # This is the most important optimization: allowing concurrent LLM calls.
+            try:
+                answer = await self.llm.generate(sys_prompt, conversation)
+            except Exception as e:
+                answer = f"LLM error: {e}"
 
-                try:
-                    answer = await self.llm.generate(sys_prompt, conversation)
-                except Exception as e:
-                    answer = f"LLM error: {e}"
+            # 4. Update history (fast, locked)
+            # We must lock again to safely update the shared history.
+            await self.append_to_history(self.channel_idx, user_msg, answer)
 
-                self.history[self.channel_idx].append(("assistant", answer))
-
-                for out in self.build_channel_messages(sender, answer):
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+            # 5. Send replies (relatively fast, unlocked)
+            # Sending messages sequentially to maintain order of parts.
+            for out in self.build_channel_messages(sender, answer):
+                await self.mesh.commands.send_chan_msg(self.channel_idx, out)
         finally:
+            # 6. Dedupe exit (fast, locked)
             await self.dedupe_exit(dedupe_key)
 
     async def on_dm_msg(self, ev) -> None:
@@ -649,6 +687,7 @@ class ChannelLLMBot:
         if not isinstance(sender_ts, int):
             sender_ts = -1
 
+        # 1. Deduplication (fast, locked)
         dedupe_key = await self.dedupe_enter("dm", -1, sender_ts, body)
         if dedupe_key is None:
             return
@@ -656,14 +695,16 @@ class ChannelLLMBot:
         try:
             if self.debug:
                 print(f"[DBG] DM payload={p} bot_id={id(self)} gen={self.generation}")
-                print(f"[DBG] DM keys={list(p.keys())}")
 
-            user = self.extract_after_trigger(body)
-            if not user:
+            user_msg = self.extract_after_trigger(body)
+            if not user_msg:
                 return
 
+            # Resolve destination before expensive LLM call
             dst = await self.resolve_dm_dst(p)
             if dst is None:
+                # Last ditch effort to refresh contacts if not found.
+                # This is a blocking call, but necessary if we can't reply.
                 await self.refresh_contacts_best_effort()
                 dst = await self.resolve_dm_dst(p)
 
@@ -671,26 +712,34 @@ class ChannelLLMBot:
                 if self.debug:
                     print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
                 return
-
-            async with self._llm_lock:
-                if user.lower() == "ping":
-                    for out in self.build_dm_messages("pong"):
-                        await self.mesh.commands.send_msg(dst, out)
-                    return
-
-                conversation = self.build_conversation(user)
-
-                requester_ctx = self.build_requester_context("dm", p, sender_name=sender)
-                sys_prompt = self.effective_system_prompt(requester_ctx)
-
-                try:
-                    answer = await self.llm.generate(sys_prompt, conversation)
-                except Exception as e:
-                    answer = f"LLM error: {e}"
-
-                for out in self.build_dm_messages(answer):
+            
+            if user_msg.lower() == "ping":
+                for out in self.build_dm_messages("pong"):
                     await self.mesh.commands.send_msg(dst, out)
+                return
+
+            # 2. Prepare context and prompt (fast, unlocked)
+            # DMs use the same channel index for history for simplicity in this bot.
+            hist_snapshot = await self.get_conversation_snapshot(self.channel_idx)
+            conversation = hist_snapshot + [("user", user_msg)]
+
+            requester_ctx = self.build_requester_context("dm", p, sender_name=sender)
+            sys_prompt = self.effective_system_prompt(requester_ctx)
+
+            # 3. Call LLM (SLOW, UNLOCKED)
+            try:
+                answer = await self.llm.generate(sys_prompt, conversation)
+            except Exception as e:
+                answer = f"LLM error: {e}"
+
+            # 4. Update history (fast, locked)
+            await self.append_to_history(self.channel_idx, user_msg, answer)
+
+            # 5. Send replies (relatively fast, unlocked)
+            for out in self.build_dm_messages(answer):
+                await self.mesh.commands.send_msg(dst, out)
         finally:
+            # 6. Dedupe exit (fast, locked)
             await self.dedupe_exit(dedupe_key)
 
 
@@ -721,22 +770,23 @@ async def create_mesh_connection() -> MeshCore:
 
         print(f"[INFO] MeshCore transport=serial port={serial_port} baud={baud}")
 
-        if hasattr(MeshCore, "create_serial"):
-            mesh = await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
-            if mesh is None:
-                raise RuntimeError("MeshCore.create_serial() returned None")
-            return mesh
-
-        for alt in ("create_uart", "create_usb", "create_serial_port"):
-            if hasattr(MeshCore, alt):
-                fn = getattr(MeshCore, alt)
-                mesh = await fn(serial_port, baud, auto_reconnect=False)
+        # Try known factory methods for serial connection
+        for factory_method in ["create_serial", "create_uart", "create_usb", "create_serial_port"]:
+            if hasattr(MeshCore, factory_method):
+                fn = getattr(MeshCore, factory_method)
+                # Some methods might not take baud rate, but most do.
+                try:
+                    mesh = await fn(serial_port, baud, auto_reconnect=False)
+                except TypeError:
+                     # Fallback for methods that might not take baud
+                    mesh = await fn(serial_port, auto_reconnect=False)
+                
                 if mesh is None:
-                    raise RuntimeError(f"MeshCore.{alt}() returned None")
+                    raise RuntimeError(f"MeshCore.{factory_method}() returned None")
                 return mesh
 
         raise RuntimeError(
-            "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
+            "Your meshcore package does not expose a known serial creation method. "
             "Run: python -c \"from meshcore import MeshCore; print([m for m in dir(MeshCore) if 'create' in m])\""
         )
 
@@ -754,7 +804,7 @@ def current_generation() -> int:
     return _CURRENT_GENERATION
 
 
-async def run_bot_once(generation: int) -> None:
+async def run_bot_once(generation: int, llm: LLMClient) -> None:
     channel_name = env_str("MESHCORE_CHANNEL_NAME", "#avl-ai")
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
@@ -766,31 +816,11 @@ async def run_bot_once(generation: int) -> None:
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     include_requester_context = env_bool("INCLUDE_REQUESTER_CONTEXT", True)
 
-    backend = env_str("LLM_BACKEND", "gemini").lower()
-
-    llm: LLMClient
-    if backend == "gemini":
-        api_key = env_str("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("Missing GEMINI_API_KEY")
-        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
-        llm = GeminiClient(api_key=api_key, model=model)
-    elif backend == "ollama":
-        base_url = env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        model = env_str("OLLAMA_MODEL", "llama3.2:latest")
-        keep_alive = env_str("OLLAMA_KEEP_ALIVE", "5m")
-        llm = OllamaClient(base_url=base_url, model=model, keep_alive=keep_alive)
-    elif backend == "openai_compat":
-        base_url = env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
-        model = env_str("LOCAL_LLM_MODEL", "local-model")
-        api_key = env_str("LOCAL_LLM_API_KEY", "") or None
-        temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
-        llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
-    else:
-        raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+    # LLM client creation is now moved to main()
 
     print("[INFO] connecting to MeshCore...")
     mesh = await create_mesh_connection()
+    # Give the connection a moment to settle
     await asyncio.sleep(1.0)
 
     if mesh is None:
@@ -798,7 +828,12 @@ async def run_bot_once(generation: int) -> None:
 
     await mesh.start_auto_message_fetching()
 
-    chan_idx = await resolve_channel_idx(mesh, channel_name, max_channels=scan_max)
+    try:
+        chan_idx = await resolve_channel_idx(mesh, channel_name, max_channels=scan_max)
+    except RuntimeError as e:
+        print(f"[ERROR] {e}")
+        await mesh.aclose()
+        return
 
     print("[OK] Channel map:")
     for i in range(scan_max):
@@ -837,7 +872,6 @@ async def run_bot_once(generation: int) -> None:
 
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
     print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
-    print(f"[LLM] backend={backend}")
     print(f"[CTX] INCLUDE_REQUESTER_CONTEXT={1 if include_requester_context else 0}")
 
     loop = asyncio.get_running_loop()
@@ -853,6 +887,7 @@ async def run_bot_once(generation: int) -> None:
     async def health_monitor() -> None:
         while not disconnect_future.done():
             try:
+                # Active health check
                 ev = await mesh.commands.get_channel(chan_idx)
                 if ev is None or ev.type == EventType.ERROR:
                     print("[WARN] health check failed; forcing reconnect")
@@ -876,35 +911,70 @@ async def run_bot_once(generation: int) -> None:
             await monitor_task
         except asyncio.CancelledError:
             pass
-
-        try:
-            await llm.aclose()
-        except Exception:
-            pass
+        
+        print("[INFO] Closing MeshCore connection...")
+        await mesh.aclose()
+        # LLM client aclose() is now handled in main()
 
 
 async def main() -> None:
     global _CURRENT_GENERATION
 
+    # Initialize LLM client once, outside the reconnect loop.
+    backend = env_str("LLM_BACKEND", "gemini").lower()
+    print(f"[LLM] Initializing backend={backend}")
+
+    llm: LLMClient
+    if backend == "gemini":
+        api_key = env_str("GEMINI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Missing GEMINI_API_KEY")
+        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
+        llm = GeminiClient(api_key=api_key, model=model)
+    elif backend == "ollama":
+        base_url = env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        model = env_str("OLLAMA_MODEL", "llama3.2:latest")
+        keep_alive = env_str("OLLAMA_KEEP_ALIVE", "5m")
+        llm = OllamaClient(base_url=base_url, model=model, keep_alive=keep_alive)
+    elif backend == "openai_compat":
+        base_url = env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+        model = env_str("LOCAL_LLM_MODEL", "local-model")
+        api_key = env_str("LOCAL_LLM_API_KEY", "") or None
+        temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
+        llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
+    else:
+        raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+
     base_delay = env_int("RECONNECT_DELAY_S", 5)
     max_delay = env_int("RECONNECT_MAX_DELAY_S", 60)
     delay = base_delay
 
-    while True:
-        try:
-            _CURRENT_GENERATION += 1
-            gen = _CURRENT_GENERATION
-            await run_bot_once(gen)
-            delay = base_delay
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"[WARN] bot session ended: {e}")
+    try:
+        while True:
+            try:
+                _CURRENT_GENERATION += 1
+                gen = _CURRENT_GENERATION
+                # Pass the persistent LLM client instance
+                await run_bot_once(gen, llm)
+                # If run_bot_once returns normally, reset delay
+                delay = base_delay
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[WARN] bot session ended unexpectedly: {e}")
 
-        print(f"[INFO] reconnecting in {delay}s...")
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, max_delay)
+            print(f"[INFO] reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
+            # Exponential backoff
+            delay = min(delay * 2, max_delay)
+    finally:
+        # Ensure LLM client is closed on application exit
+        print("[INFO] Closing LLM client...")
+        await llm.aclose()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user.")
