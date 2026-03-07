@@ -454,14 +454,14 @@ class ChannelLLMBot:
     async def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Determines the destination for a DM reply.
-        Priority: Full public_key > Resolved prefix > Raw prefix from payload.
+        Priority: Full public_key > Resolved prefix > Prefix in public_key field (Fallback).
         """
         # 1. If payload already has full public_key, use it
         pk = payload.get("public_key")
         if isinstance(pk, str) and pk.strip():
             return {"public_key": pk.strip()}
 
-        # 2. Try to resolve prefix to a full public_key via cache
+        # 2. Get the prefix
         prefix = payload.get("pubkey_prefix")
         if not isinstance(prefix, str) or not prefix.strip():
             return None
@@ -469,6 +469,7 @@ class ChannelLLMBot:
         prefix = prefix.strip().lower()
         pubkey = None
 
+        # 3. Try to resolve prefix to a full public_key via cache
         async with self._contacts_lock:
             pubkey = self._contacts_by_prefix.get(prefix)
             if not pubkey:
@@ -481,11 +482,13 @@ class ChannelLLMBot:
         if pubkey:
             return {"public_key": pubkey}
 
-        # 3. FALLBACK: Use the raw prefix as the destination.
-        # MeshCore can often route messages using just the pubkey_prefix.
+        # 4. FALLBACK: Return the prefix inside the 'public_key' field.
+        # This satisfies the meshcore library's validation (Contact object must have 'public_key')
+        # while allowing the mesh to attempt routing via the prefix.
         if self.debug:
-            print(f"[DBG] Prefix {prefix} not in contacts; attempting reply via prefix fallback.")
-        return {"pubkey_prefix": prefix}
+            print(f"[DBG] Prefix {prefix} not in contacts; providing prefix in public_key field for library compatibility.")
+        
+        return {"public_key": prefix}
 
     # ---------------- Requester context ----------------
 
