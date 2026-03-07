@@ -516,7 +516,7 @@ class ChannelLLMBot:
             stats_parts.append(f"Hops: {hops}")
 
         # 3. Assemble final string
-        reply = f"🤖 Ack {who}"
+        reply = f"🤖 Ack {who}\n"
         if stats_parts:
             reply += " [" + " | ".join(stats_parts) + "]"
 
