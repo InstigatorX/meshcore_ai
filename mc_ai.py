@@ -17,7 +17,8 @@ Features
 - Splits long replies safely, accounting for numbering/prefix overhead
 - Handles concurrent LLM requests for better responsiveness.
 - Persistent LLM client across mesh reconnections.
-- **UPDATED:** "ping" command now works WITHOUT the trigger (just type "ping").
+- "ping" command now works WITHOUT the trigger (just type "ping").
+- **UPDATED:** Maintains conversation history per-user (based on pubkey_prefix).
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -61,6 +62,7 @@ OpenAI-compatible
 """
 
 import asyncio
+import logging
 import os
 import re
 import time
@@ -73,6 +75,8 @@ from meshcore import EventType, MeshCore
 # Check for google-genai library
 try:
     import google.genai as genai
+    # Suppress noisy INFO logs from google_genai library (e.g., "AFC is enabled...")
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
 except ImportError:
     genai = None
 
@@ -226,9 +230,6 @@ DEFAULT_SYSTEM_PROMPT = (
 # Default template for ping replies if env var is not set.
 DEFAULT_PING_TEMPLATE = "🤖 Ack {who}\n[{stats}]"
 
-# Index used for DM history storage
-DM_HISTORY_IDX = -1
-
 # ---------------------------
 # LLM clients
 # ---------------------------
@@ -366,6 +367,7 @@ class ChannelLLMBot:
         self.monitored_channels = monitored_channels
         self.trigger = trigger
         self.max_reply_chars = max_reply_chars
+        self.history_turns = history_turns
         self.debug = debug
         self.dedupe_window_s = dedupe_window_s
         self.system_prompt = system_prompt
@@ -377,15 +379,9 @@ class ChannelLLMBot:
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
         # History is shared state accessed by concurrent message handlers.
-        # Keyed by channel index. Index -1 is used for DMs.
-        self.history: Dict[int, Deque[Tuple[str, str]]] = {}
+        # Keyed by user_id (e.g., pubkey_prefix).
+        self.history: Dict[str, Deque[Tuple[str, str]]] = {}
         
-        # Initialize history buffers for all monitored channels
-        for idx in self.monitored_channels:
-             self.history[idx] = deque(maxlen=history_turns * 2)
-        # Initialize history buffer for DMs
-        self.history[DM_HISTORY_IDX] = deque(maxlen=history_turns * 2)
-
         # Lock to protect access to self.history
         self._history_lock = asyncio.Lock()
 
@@ -618,18 +614,21 @@ class ChannelLLMBot:
             self._seen_ts[key] = time.time()
 
     # Note: This method is now async because it needs to acquire the lock.
-    async def get_conversation_snapshot(self, history_idx: int) -> List[Tuple[str, str]]:
+    async def get_conversation_snapshot(self, user_id: str) -> List[Tuple[str, str]]:
         async with self._history_lock:
-            # Return a copy of the current history for the given index
-            if history_idx in self.history:
-                 return list(self.history[history_idx])
-            return []
+            # Initialize history buffer for this user if it doesn't exist
+            if user_id not in self.history:
+                # We use self.history_turns which was added to __init__
+                self.history[user_id] = deque(maxlen=self.history_turns * 2)
+            
+            # Return a copy of the current history for the given user
+            return list(self.history[user_id])
 
-    async def append_to_history(self, history_idx: int, user_msg: str, assistant_msg: str) -> None:
+    async def append_to_history(self, user_id: str, user_msg: str, assistant_msg: str) -> None:
         async with self._history_lock:
-            if history_idx in self.history:
-                self.history[history_idx].append(("user", user_msg))
-                self.history[history_idx].append(("assistant", assistant_msg))
+            # We assume get_conversation_snapshot was called first, so the buffer exists.
+            self.history[user_id].append(("user", user_msg))
+            self.history[user_id].append(("assistant", assistant_msg))
 
     def build_channel_messages(self, sender: str, answer: str) -> List[str]:
         fixed_prefix = f"@[{sender}] " if sender else ""
@@ -700,10 +699,15 @@ class ChannelLLMBot:
             # If it wasn't a ping, ensure there is actual content before asking LLM
             if not user_msg:
                 return
+            
+            # Determine a unique user ID for history tracking
+            user_id = p.get("pubkey_prefix")
+            if not user_id:
+                user_id = sender # Fallback to name if no pubkey_prefix
 
             # 2. Prepare context and prompt (fast, unlocked)
-            # Get history snapshot for THIS specific channel index
-            hist_snapshot = await self.get_conversation_snapshot(chan_idx)
+            # Get history snapshot for THIS specific user
+            hist_snapshot = await self.get_conversation_snapshot(user_id)
             conversation = hist_snapshot + [("user", user_msg)]
 
             requester_ctx = self.build_requester_context("chan", p, channel_idx=chan_idx, sender_name=sender)
@@ -717,8 +721,8 @@ class ChannelLLMBot:
                 answer = f"LLM error: {e}"
 
             # 4. Update history (fast, locked)
-            # Update history for THIS specific channel index
-            await self.append_to_history(chan_idx, user_msg, answer)
+            # Update history for THIS specific user
+            await self.append_to_history(user_id, user_msg, answer)
 
             # 5. Send replies (relatively fast, unlocked)
             # Sending messages sequentially to maintain order of parts back to the source channel.
@@ -793,10 +797,23 @@ class ChannelLLMBot:
                     print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
                 return
             
-            # 2. Prepare context and prompt (fast, unlocked)
-            # Use the dedicated DM history index
-            hist_snapshot = await self.get_conversation_snapshot(DM_HISTORY_IDX)
-            conversation = hist_snapshot + [("user", user_msg)]
+            # Determine a unique user ID for history tracking
+            user_id = p.get("pubkey_prefix")
+            if not user_id:
+                # Fallback for DMs is trickier, sender name is often empty.
+                # Use full pubkey if available, otherwise we can't track history reliably.
+                user_id = p.get("public_key")
+
+            if not user_id:
+                if self.debug:
+                     print("[DBG] Cannot determine user ID for history tracking in DM.")
+                # Proceed without history if user can't be identified
+                conversation = [("user", user_msg)]
+            else:
+                # 2. Prepare context and prompt (fast, unlocked)
+                # Get history snapshot for THIS specific user
+                hist_snapshot = await self.get_conversation_snapshot(user_id)
+                conversation = hist_snapshot + [("user", user_msg)]
 
             requester_ctx = self.build_requester_context("dm", p, sender_name=sender)
             sys_prompt = self.effective_system_prompt(requester_ctx)
@@ -808,7 +825,8 @@ class ChannelLLMBot:
                 answer = f"LLM error: {e}"
 
             # 4. Update history (fast, locked)
-            await self.append_to_history(DM_HISTORY_IDX, user_msg, answer)
+            if user_id:
+                await self.append_to_history(user_id, user_msg, answer)
 
             # 5. Send replies (relatively fast, unlocked)
             for out in self.build_dm_messages(answer):
