@@ -959,20 +959,46 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
     health_check_idx = next(iter(monitored_channels.keys()))
 
     async def health_monitor() -> None:
+        consecutive_failures = 0
+        max_failures = env_int("HEALTHCHECK_MAX_FAILURES", 3)
+        interval_s = env_int("HEALTHCHECK_INTERVAL_S", 10)
+
         while not disconnect_future.done():
             try:
                 ev = await mesh.commands.get_channel(health_check_idx)
+
                 if ev is None or ev.type == EventType.ERROR:
-                    print(f"[WARN] health check failed on channel idx {health_check_idx}; forcing reconnect")
+                    consecutive_failures += 1
+                    print(
+                        f"[WARN] health check failed on channel idx {health_check_idx} "
+                        f"({consecutive_failures}/{max_failures})"
+                    )
+                else:
+                    if consecutive_failures and debug:
+                        print("[DBG] health check recovered")
+                    consecutive_failures = 0
+
+                if consecutive_failures >= max_failures:
+                    print(
+                        f"[WARN] health check failed {consecutive_failures} times in a row; forcing reconnect"
+                    )
                     if not disconnect_future.done():
                         disconnect_future.set_result(None)
                     return
+
             except Exception as e:
-                print(f"[WARN] health check exception: {e}")
-                if not disconnect_future.done():
-                    disconnect_future.set_result(None)
-                return
-            await asyncio.sleep(10)
+                consecutive_failures += 1
+                print(
+                    f"[WARN] health check exception ({consecutive_failures}/{max_failures}): {e}"
+                )
+
+                if consecutive_failures >= max_failures:
+                    print("[WARN] too many consecutive health check exceptions; forcing reconnect")
+                    if not disconnect_future.done():
+                        disconnect_future.set_result(None)
+                    return
+
+            await asyncio.sleep(interval_s)
 
     monitor_task = asyncio.create_task(health_monitor())
 
