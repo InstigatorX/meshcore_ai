@@ -556,6 +556,9 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
         mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
         mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
         mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
+        # Add this as a backup subscription
+        if hasattr(EventType, "DIRECT_MSG_RECV"):
+            mesh.subscribe(EventType.DIRECT_MSG_RECV, bot.on_dm_msg)
         await bot.refresh_contacts_best_effort()
 
         print(f"[OK] Gen {generation} connected to: {list(monitored.values())}")
