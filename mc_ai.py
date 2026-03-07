@@ -760,8 +760,10 @@ class ChannelLLMBot:
             if self.debug:
                 print(f"[DBG] DM payload={p} bot_id={id(self)} gen={self.generation}")
 
-            # Check for bare "ping" command BEFORE trigger extraction
-            if body.strip().lower() == "ping":
+            stripped_body = body.strip()
+
+            # Check for bare "ping" command
+            if stripped_body.lower() == "ping":
                  # Resolve destination before sending ping reply
                 dst = await self.resolve_dm_dst(p)
                 if dst is None:
@@ -780,8 +782,12 @@ class ChannelLLMBot:
                     await self.mesh.commands.send_msg(dst, out)
                 return
 
-            user_msg = self.extract_after_trigger(body)
+            # --- FIX: For DMs, don't require trigger ---
+            # If it's not a ping, the whole body is the message.
+            user_msg = stripped_body
+
             if not user_msg:
+                # Ignore empty messages
                 return
 
             # Resolve destination before expensive LLM call
