@@ -18,7 +18,7 @@ Features
 - Handles concurrent LLM requests for better responsiveness.
 - Persistent LLM client across mesh reconnections.
 - Robust message splitting logic.
-- **UPDATED:** "ping" command replies with requester context (SNR, Hops).
+- **UPDATED:** "ping" command replies with configurable requester context.
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -36,6 +36,7 @@ Env vars (Bot)
   DEBUG                         default: 0
   DEDUPE_WINDOW_S               default: 3.0
   INCLUDE_REQUESTER_CONTEXT     default: 1
+  PING_REPLY_TEMPLATE           default: "🤖 Ack {who}\n[{stats}]"
   RECONNECT_DELAY_S             default: 5
   RECONNECT_MAX_DELAY_S         default: 60
 
@@ -238,6 +239,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "If uncertain, say so briefly."
 )
 
+# Default template for ping replies if env var is not set.
+DEFAULT_PING_TEMPLATE = "🤖 Ack {who}\n[{stats}]"
 
 # ---------------------------
 # LLM clients
@@ -368,6 +371,7 @@ class ChannelLLMBot:
         debug: bool,
         system_prompt: str,
         include_requester_context: bool,
+        ping_reply_template: str,
         generation: int,
         current_generation_ref,
     ):
@@ -381,6 +385,7 @@ class ChannelLLMBot:
         self.dedupe_window_s = dedupe_window_s
         self.system_prompt = system_prompt
         self.include_requester_context = include_requester_context
+        self.ping_reply_template = ping_reply_template
         self.generation = generation
         self.current_generation_ref = current_generation_ref
 
@@ -484,7 +489,7 @@ class ChannelLLMBot:
     # ---------------- Requester context ----------------
 
     def build_ping_reply(self, payload: Dict[str, Any], sender_name_from_text: str = "") -> str:
-        """Builds a human-readable reply with network stats for 'ping' requests."""
+        """Builds a human-readable reply with network stats for 'ping' requests using a configurable template."""
         # 1. Identify whomever we are replying to
         who = sender_name_from_text
         if not who:
@@ -515,10 +520,18 @@ class ChannelLLMBot:
             hops = max(0, path_len - 1)
             stats_parts.append(f"Hops: {hops}")
 
-        # 3. Assemble final string
-        reply = f"🤖 Ack {who}\n"
-        if stats_parts:
-            reply += " [" + " | ".join(stats_parts) + "]"
+        stats_str = " | ".join(stats_parts)
+
+        # 3. Assemble final string using template
+        try:
+            reply = self.ping_reply_template.format(who=who, stats=stats_str)
+        except Exception as e:
+            print(f"[WARN] Error formatting PING_REPLY_TEMPLATE: {e}. Falling back to default.")
+            reply = DEFAULT_PING_TEMPLATE.format(who=who, stats=stats_str)
+
+        # Cleanup empty brackets if stats were missing but template had brackets.
+        # This happens if template is like "[{stats}]" and stats_str is empty.
+        reply = reply.replace("[]", "").strip()
 
         return reply
 
@@ -862,6 +875,7 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
     debug = env_bool("DEBUG", False)
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     include_requester_context = env_bool("INCLUDE_REQUESTER_CONTEXT", True)
+    ping_reply_template = env_str("PING_REPLY_TEMPLATE", DEFAULT_PING_TEMPLATE)
 
     # LLM client creation is now moved to main()
 
@@ -903,6 +917,7 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
         debug=debug,
         system_prompt=system_prompt,
         include_requester_context=include_requester_context,
+        ping_reply_template=ping_reply_template,
         generation=generation,
         current_generation_ref=current_generation,
     )
@@ -920,6 +935,7 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
     print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
     print(f"[CTX] INCLUDE_REQUESTER_CONTEXT={1 if include_requester_context else 0}")
+    print(f"[CFG] PING_REPLY_TEMPLATE='{ping_reply_template}'")
 
     loop = asyncio.get_running_loop()
     disconnect_future: asyncio.Future[None] = loop.create_future()
@@ -1024,4 +1040,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user.")
+        print("\n[INFO] Bot stopped by user.")  
