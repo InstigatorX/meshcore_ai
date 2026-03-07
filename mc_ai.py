@@ -452,26 +452,40 @@ class ChannelLLMBot:
                 print(f"[DBG] refresh_contacts_best_effort error: {e}")
 
     async def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Determines the destination for a DM reply.
+        Priority: Full public_key > Resolved prefix > Raw prefix from payload.
+        """
+        # 1. If payload already has full public_key, use it
         pk = payload.get("public_key")
         if isinstance(pk, str) and pk.strip():
             return {"public_key": pk.strip()}
 
+        # 2. Try to resolve prefix to a full public_key via cache
         prefix = payload.get("pubkey_prefix")
         if not isinstance(prefix, str) or not prefix.strip():
             return None
+        
         prefix = prefix.strip().lower()
+        pubkey = None
 
         async with self._contacts_lock:
             pubkey = self._contacts_by_prefix.get(prefix)
             if not pubkey:
+                # Manual scan of cache for partial matches
                 for pk2 in self._contacts_by_pubkey.keys():
                     if pk2.startswith(prefix):
                         pubkey = pk2
                         break
 
-        if not pubkey:
-            return None
-        return {"public_key": pubkey}
+        if pubkey:
+            return {"public_key": pubkey}
+
+        # 3. FALLBACK: Use the raw prefix as the destination.
+        # MeshCore can often route messages using just the pubkey_prefix.
+        if self.debug:
+            print(f"[DBG] Prefix {prefix} not in contacts; attempting reply via prefix fallback.")
+        return {"pubkey_prefix": prefix}
 
     # ---------------- Requester context ----------------
 
