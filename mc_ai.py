@@ -289,6 +289,19 @@ class ChannelLLMBot:
     def is_stale(self) -> bool:
         return self.generation != self.current_generation_ref()
 
+    async def _safe_send_dm(self, dst: Dict[str, Any], text: str):
+        """Attempts multiple MeshCore methods to send a DM."""
+        for method_name in ["send_msg", "send_direct_msg", "send_priv_msg"]:
+            if hasattr(self.mesh.commands, method_name):
+                try:
+                    method = getattr(self.mesh.commands, method_name)
+                    await method(dst, text)
+                    if self.debug: print(f"[DBG] DM sent via {method_name}")
+                    return
+                except Exception as e:
+                    if self.debug: print(f"[DBG] DM {method_name} failed: {e}")
+        print("[ERROR] Failed to find a working DM send method in meshcore library")
+
     async def upsert_contact(self, contact: Dict[str, Any]) -> None:
         pk = contact.get("public_key")
         if not isinstance(pk, str) or not pk.strip(): return
@@ -319,18 +332,36 @@ class ChannelLLMBot:
             if self.debug: print(f"[DBG] refresh_contacts error: {e}")
 
     async def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Determines the destination for a DM reply.
+        Ensures 'public_key' field exists for library compatibility.
+        """
+        # 1. Full public_key
         pk = payload.get("public_key")
-        if isinstance(pk, str) and pk.strip(): return {"public_key": pk.strip()}
+        if isinstance(pk, str) and pk.strip():
+            return {"public_key": pk.strip()}
+
+        # 2. Resolve prefix from cache
         prefix = payload.get("pubkey_prefix")
-        if not isinstance(prefix, str) or not prefix.strip(): return None
+        if not isinstance(prefix, str) or not prefix.strip():
+            return None
+        
         prefix = prefix.strip().lower()
         async with self._contacts_lock:
             pubkey = self._contacts_by_prefix.get(prefix)
             if not pubkey:
                 for pk2 in self._contacts_by_pubkey.keys():
-                    if pk2.startswith(prefix): pubkey = pk2; break
-        if pubkey: return {"public_key": pubkey}
-        return {"public_key": prefix} # Fallback for MeshCore library validation
+                    if pk2.startswith(prefix):
+                        pubkey = pk2
+                        break
+        
+        if pubkey:
+            return {"public_key": pubkey}
+
+        # 3. Fallback: Use prefix in the public_key field
+        if self.debug:
+            print(f"[DBG] DM destination resolved as prefix fallback: {prefix}")
+        return {"public_key": prefix}
 
     def build_ping_reply(self, payload: Dict[str, Any], sender_name_from_text: str = "") -> str:
         who = sender_name_from_text
@@ -434,27 +465,56 @@ class ChannelLLMBot:
         if self.is_stale(): return
         p = ev.payload or {}
         if not isinstance(p, dict): return
-        sender, body = self.split_sender_and_body(p.get("text", ""))
-        dedupe_key = await self.dedupe_enter("dm", -1, p.get("sender_timestamp", -1), body)
+
+        # DMs are raw text, don't use split_sender_and_body
+        raw_text = p.get("text") or p.get("body") or ""
+        if not raw_text: return
+        
+        body = raw_text.strip()
+        sender_ts = p.get("sender_timestamp", -1)
+
+        dedupe_key = await self.dedupe_enter("dm", -1, sender_ts, body)
         if not dedupe_key: return
+
         try:
-            stripped = body.strip()
+            if self.debug:
+                print(f"[DBG] DM Processing: '{body}' from prefix {p.get('pubkey_prefix')}")
+
             dst = await self.resolve_dm_dst(p)
-            if not dst: return
-            if stripped.lower() == "ping":
-                for out in split_for_transport(self.build_ping_reply(p, sender), self.max_reply_chars):
-                    await self.mesh.commands.send_msg(dst, out)
+            if not dst:
+                if self.debug: print("[DBG] DM ignored: Could not resolve destination")
                 return
-            user_msg = stripped
-            user_id = p.get("pubkey_prefix") or p.get("public_key")
-            hist = await self.get_conversation_snapshot(user_id) if user_id else [("user", user_msg)]
-            sys_prompt = f"{self.system_prompt}\n\n{self.build_requester_context('dm', p, sender_name=sender)}"
-            try: answer = await self.llm.generate(sys_prompt, hist + [("user", user_msg)])
-            except Exception as e: answer = f"LLM error: {e}"
-            if user_id: await self.append_to_history(user_id, user_msg, answer)
+
+            # Check for ping
+            if body.lower() == "ping":
+                reply_text = self.build_ping_reply(p)
+                for out in split_for_transport(reply_text, self.max_reply_chars):
+                    await self._safe_send_dm(dst, out)
+                return
+
+            # Standard LLM logic (DMs do NOT require trigger)
+            user_msg = body
+            user_id = p.get("pubkey_prefix") or p.get("public_key") or "unknown_dm"
+            
+            hist = await self.get_conversation_snapshot(user_id)
+            sys_prompt = f"{self.system_prompt}\n\n{self.build_requester_context('dm', p)}"
+            
+            if self.debug: print(f"[DBG] DM calling LLM for user {user_id}")
+            
+            try:
+                answer = await self.llm.generate(sys_prompt, hist + [("user", user_msg)])
+            except Exception as e:
+                answer = f"LLM error: {e}"
+
+            await self.append_to_history(user_id, user_msg, answer)
+
             for out in split_for_transport(answer, self.max_reply_chars):
-                await self.mesh.commands.send_msg(dst, out)
-        finally: await self.dedupe_exit(dedupe_key)
+                await self._safe_send_dm(dst, out)
+
+        except Exception as e:
+            print(f"[ERROR] on_dm_msg crashed: {e}")
+        finally:
+            await self.dedupe_exit(dedupe_key)
 
 # ---------------------------
 # execution
