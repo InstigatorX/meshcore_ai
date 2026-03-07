@@ -15,9 +15,10 @@ Features
 - Adds in-flight dedupe to prevent duplicate LLM calls
 - Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
 - Splits long replies safely, accounting for numbering/prefix overhead
-- **OPTIMIZED:** Handles concurrent LLM requests for better responsiveness.
-- **OPTIMIZED:** Persistent LLM client across mesh reconnections.
-- **OPTIMIZED:** More robust message splitting logic.
+- Handles concurrent LLM requests for better responsiveness.
+- Persistent LLM client across mesh reconnections.
+- Robust message splitting logic.
+- **UPDATED:** "ping" command replies with requester context (SNR, Hops).
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -482,6 +483,45 @@ class ChannelLLMBot:
 
     # ---------------- Requester context ----------------
 
+    def build_ping_reply(self, payload: Dict[str, Any], sender_name_from_text: str = "") -> str:
+        """Builds a human-readable reply with network stats for 'ping' requests."""
+        # 1. Identify whomever we are replying to
+        who = sender_name_from_text
+        if not who:
+            pk = payload.get("pubkey_prefix")
+            if isinstance(pk, str) and pk:
+                who = pk[:8]  # Use first 8 chars of prefix if name unavailable
+            else:
+                who = "unknown"
+
+        # 2. Gather network statistics
+        stats_parts = []
+
+        # SNR (Signal-to-Noise Ratio)
+        snr = payload.get("SNR")
+        if isinstance(snr, (int, float)):
+            # Provide a basic qualitative interpretation along with the raw value
+            quality = "Poor"
+            if snr > 10: quality = "Ok"
+            if snr > 20: quality = "Good"
+            if snr > 30: quality = "Great"
+            stats_parts.append(f"SNR: {snr:.0f}dB ({quality})")
+
+        # Hops (Path Length)
+        path_len = payload.get("path_len")
+        if isinstance(path_len, int):
+            # path_len is usually total nodes in path, including start.
+            # Hops = path_len - 1. (1 means direct).
+            hops = max(0, path_len - 1)
+            stats_parts.append(f"Hops: {hops}")
+
+        # 3. Assemble final string
+        reply = f"Ack {who}"
+        if stats_parts:
+            reply += " [" + " | ".join(stats_parts) + "]"
+
+        return reply
+
     def build_requester_context(
         self,
         scope: str,
@@ -637,7 +677,10 @@ class ChannelLLMBot:
                 return
             
             if user_msg.lower() == "ping":
-                for out in self.build_channel_messages(sender, "pong"):
+                # Generate a reply containing network stats instead of just "pong"
+                ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
+                # Note: build_channel_messages already prefixes with @[sender]
+                for out in self.build_channel_messages(sender, ping_reply):
                     await self.mesh.commands.send_chan_msg(self.channel_idx, out)
                 return
 
@@ -714,7 +757,11 @@ class ChannelLLMBot:
                 return
             
             if user_msg.lower() == "ping":
-                for out in self.build_dm_messages("pong"):
+                # Generate a reply containing network stats instead of just "pong"
+                # In DMs, we usually don't get the sender name in the text body,
+                # so we rely on payload data in build_ping_reply.
+                ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
+                for out in self.build_dm_messages(ping_reply):
                     await self.mesh.commands.send_msg(dst, out)
                 return
 
