@@ -17,7 +17,7 @@ Features
 - Splits long replies safely, accounting for numbering/prefix overhead
 - Handles concurrent LLM requests for better responsiveness.
 - Persistent LLM client across mesh reconnections.
-- "ping" command replies with configurable requester context.
+- **UPDATED:** "ping" command now works WITHOUT the trigger (just type "ping").
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -686,16 +686,19 @@ class ChannelLLMBot:
                 chan_name = self.monitored_channels.get(chan_idx, "unknown")
                 print(f"[DBG] channel msg on '{chan_name}' (idx={chan_idx}) payload={p} gen={self.generation}")
 
-            user_msg = self.extract_after_trigger(body)
-            if not user_msg:
-                return
-            
-            if user_msg.lower() == "ping":
-                # Generate a reply containing network stats
+            # Check for bare "ping" command BEFORE trigger extraction
+            if body.strip().lower() == "ping":
+                 # Generate a reply containing network stats
                 ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
                 # Note: build_channel_messages already prefixes with @[sender]
                 for out in self.build_channel_messages(sender, ping_reply):
                     await self.mesh.commands.send_chan_msg(chan_idx, out)
+                return
+
+            user_msg = self.extract_after_trigger(body)
+
+            # If it wasn't a ping, ensure there is actual content before asking LLM
+            if not user_msg:
                 return
 
             # 2. Prepare context and prompt (fast, unlocked)
@@ -753,6 +756,26 @@ class ChannelLLMBot:
             if self.debug:
                 print(f"[DBG] DM payload={p} bot_id={id(self)} gen={self.generation}")
 
+            # Check for bare "ping" command BEFORE trigger extraction
+            if body.strip().lower() == "ping":
+                 # Resolve destination before sending ping reply
+                dst = await self.resolve_dm_dst(p)
+                if dst is None:
+                    # Last ditch effort to refresh contacts if not found.
+                    await self.refresh_contacts_best_effort()
+                    dst = await self.resolve_dm_dst(p)
+
+                if dst is None:
+                    if self.debug:
+                        print("[DBG] Could not resolve DM destination for ping reply.")
+                    return
+
+                # Generate a reply containing network stats
+                ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
+                for out in self.build_dm_messages(ping_reply):
+                    await self.mesh.commands.send_msg(dst, out)
+                return
+
             user_msg = self.extract_after_trigger(body)
             if not user_msg:
                 return
@@ -770,13 +793,6 @@ class ChannelLLMBot:
                     print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
                 return
             
-            if user_msg.lower() == "ping":
-                # Generate a reply containing network stats
-                ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
-                for out in self.build_dm_messages(ping_reply):
-                    await self.mesh.commands.send_msg(dst, out)
-                return
-
             # 2. Prepare context and prompt (fast, unlocked)
             # Use the dedicated DM history index
             hist_snapshot = await self.get_conversation_snapshot(DM_HISTORY_IDX)
