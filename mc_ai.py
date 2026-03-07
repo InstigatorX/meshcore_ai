@@ -6,7 +6,7 @@ MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 Features
 - Connects over TCP or USB/Serial
 - Owns reconnect logic itself (MeshCore internal auto_reconnect is disabled)
-- Listens on MULTIPLE MeshCore channels defined in config.
+- Listens on MULTIPLE MeshCore channels defined in config
 - Also listens for direct messages (CONTACT_MSG_RECV)
 - Triggers on "!ai ..." at start or after "NAME: "
 - Channel replies use @[...] prefix
@@ -15,10 +15,11 @@ Features
 - Adds in-flight dedupe to prevent duplicate LLM calls
 - Resolves DM destinations via contacts cache (pubkey_prefix -> full public_key)
 - Splits long replies safely, accounting for numbering/prefix overhead
-- Handles concurrent LLM requests for better responsiveness.
-- Persistent LLM client across mesh reconnections.
-- "ping" command now works WITHOUT the trigger (just type "ping").
-- **UPDATED:** Maintains conversation history per-user (based on pubkey_prefix).
+- Handles concurrent LLM requests for better responsiveness
+- Persistent LLM client across mesh reconnections
+- "ping" command works WITHOUT the trigger (just type "ping")
+- Maintains conversation history per-user (based on pubkey_prefix when available)
+- Persists contact cache across reconnects to keep DMs working
 
 Env vars (MeshCore transport)
   MESHCORE_TRANSPORT            tcp | serial   (default: tcp)
@@ -26,13 +27,13 @@ Env vars (MeshCore transport)
   MESHCORE_PORT                 default: 5000
   MESHCORE_SERIAL_PORT          required if serial, e.g. /dev/ttyACM0
   MESHCORE_SERIAL_BAUD          default: 115200
-  MESHCORE_CHANNELS             Comma-separated list of channels to listen on.
+  MESHCORE_CHANNELS             Comma-separated list of channels to listen on
                                 default: #avl-ai
   CHANNEL_SCAN_MAX              default: 16
 
 Env vars (Bot)
   AI_TRIGGER                    default: !ai   (bash: export AI_TRIGGER='!ai')
-  MAX_REPLY_CHARS               default: 140   # final transmitted message max (safer default)
+  MAX_REPLY_CHARS               default: 140
   HISTORY_TURNS                 default: 6
   DEBUG                         default: 0
   DEDUPE_WINDOW_S               default: 3.0
@@ -67,18 +68,29 @@ import os
 import re
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import httpx
 from meshcore import EventType, MeshCore
 
-# Check for google-genai library
 try:
     import google.genai as genai
-    # Suppress noisy INFO logs from google_genai library (e.g., "AFC is enabled...")
     logging.getLogger("google_genai").setLevel(logging.WARNING)
 except ImportError:
     genai = None
+
+
+# ---------------------------
+# shared state across reconnects
+# ---------------------------
+
+_CURRENT_GENERATION = 0
+_SHARED_CONTACTS_BY_PUBKEY: Dict[str, Dict[str, Any]] = {}
+_SHARED_CONTACTS_BY_PREFIX: Dict[str, str] = {}
+
+
+def current_generation() -> int:
+    return _CURRENT_GENERATION
 
 
 # ---------------------------
@@ -126,27 +138,23 @@ def _split_with_budget(text: str, budget: int) -> List[str]:
     if budget <= 0:
         raise ValueError("budget must be > 0")
 
-    words = text.split(' ')
+    words = text.split(" ")
     chunks: List[str] = []
     current_chunk = ""
 
     for word in words:
         if not word:
             continue
-        
-        # If a single word is longer than the budget, it must be split
+
         if len(word) > budget:
             if current_chunk:
                 chunks.append(current_chunk)
                 current_chunk = ""
-            # Hard split the long word
             for i in range(0, len(word), budget):
-                chunks.append(word[i:i+budget])
-        # If adding the next word exceeds the budget, push current chunk
+                chunks.append(word[i:i + budget])
         elif len(current_chunk) + len(word) + (1 if current_chunk else 0) > budget:
             chunks.append(current_chunk)
             current_chunk = word
-        # Otherwise, add the word to the current chunk
         else:
             if current_chunk:
                 current_chunk += " " + word
@@ -155,7 +163,7 @@ def _split_with_budget(text: str, budget: int) -> List[str]:
 
     if current_chunk:
         chunks.append(current_chunk)
-    
+
     return chunks
 
 
@@ -214,8 +222,6 @@ def split_for_transport(
         np = _build_number_prefix(i, n)
         msg = f"{fixed_prefix}{np}{part}"
         if len(msg) > max_len:
-            # This should theoretically not happen with correct splitting logic,
-            # but as a safety measure, truncate.
             msg = msg[:max_len]
         out.append(msg)
     return out
@@ -227,8 +233,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "If uncertain, say so briefly."
 )
 
-# Default template for ping replies if env var is not set.
 DEFAULT_PING_TEMPLATE = "🤖 Ack {who}\n[{stats}]"
+
 
 # ---------------------------
 # LLM clients
@@ -250,7 +256,6 @@ class GeminiClient(LLMClient):
         self.client = genai.Client(api_key=api_key)
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        # Construct prompt more efficiently
         prompt_parts = [system_prompt, "\nConversation:"]
         for role, msg in conversation:
             prompt_parts.append(f"{role}: {msg}")
@@ -258,7 +263,6 @@ class GeminiClient(LLMClient):
         prompt = "\n".join(prompt_parts)
 
         def _call() -> str:
-            # This is a blocking call, so we run it in a separate thread
             resp = self.client.models.generate_content(model=self.model, contents=prompt)
             txt = getattr(resp, "text", None)
             return str(txt).strip() if txt else ""
@@ -277,7 +281,6 @@ class OllamaClient(LLMClient):
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         messages = [{"role": "system", "content": system_prompt}]
         for role, msg in conversation:
-            # Map 'assistant' and 'user' to standard roles
             r = "assistant" if role == "assistant" else "user"
             messages.append({"role": r, "content": msg})
 
@@ -361,6 +364,8 @@ class ChannelLLMBot:
         ping_reply_template: str,
         generation: int,
         current_generation_ref,
+        contacts_by_pubkey: Dict[str, Dict[str, Any]],
+        contacts_by_prefix: Dict[str, str],
     ):
         self.mesh = mesh
         self.llm = llm
@@ -378,11 +383,7 @@ class ChannelLLMBot:
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
-        # History is shared state accessed by concurrent message handlers.
-        # Keyed by user_id (e.g., pubkey_prefix).
         self.history: Dict[str, Deque[Tuple[str, str]]] = {}
-        
-        # Lock to protect access to self.history
         self._history_lock = asyncio.Lock()
 
         self._dedupe_lock = asyncio.Lock()
@@ -390,8 +391,8 @@ class ChannelLLMBot:
         self._inflight: Dict[Tuple[str, int, int, str], float] = {}
 
         self._contacts_lock = asyncio.Lock()
-        self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
-        self._contacts_by_prefix: Dict[str, str] = {}
+        self._contacts_by_pubkey = contacts_by_pubkey
+        self._contacts_by_prefix = contacts_by_prefix
 
     # ---------------- lifecycle ----------------
 
@@ -425,20 +426,31 @@ class ChannelLLMBot:
             return
 
         candidates: List[Dict[str, Any]] = []
+
         if isinstance(p.get("contacts"), list):
             for c in p["contacts"]:
                 if isinstance(c, dict):
                     candidates.append(c)
 
+        if isinstance(p.get("contact"), dict):
+            candidates.append(p["contact"])
+
         if "public_key" in p and isinstance(p.get("public_key"), str):
             candidates.append(p)
+
+        for k in ("payload", "value", "data"):
+            v = p.get(k)
+            if isinstance(v, dict) and isinstance(v.get("public_key"), str):
+                candidates.append(v)
 
         for c in candidates:
             await self.upsert_contact(c)
 
+        if self.debug and candidates:
+            print(f"[DBG] processed {len(candidates)} contact candidate(s) from {ev.type}")
+
     async def refresh_contacts_best_effort(self) -> None:
         try:
-            # Try different methods depending on meshcore version
             if hasattr(self.mesh.commands, "get_contacts"):
                 await getattr(self.mesh.commands, "get_contacts")()
                 return
@@ -458,7 +470,10 @@ class ChannelLLMBot:
 
         prefix = payload.get("pubkey_prefix")
         if not isinstance(prefix, str) or not prefix.strip():
+            if self.debug:
+                print("[DBG] DM payload has no public_key or pubkey_prefix")
             return None
+
         prefix = prefix.strip().lower()
 
         async with self._contacts_lock:
@@ -467,59 +482,61 @@ class ChannelLLMBot:
                 for pk2 in self._contacts_by_pubkey.keys():
                     if pk2.startswith(prefix):
                         pubkey = pk2
+                        self._contacts_by_prefix[prefix] = pk2
                         break
 
         if not pubkey:
+            if self.debug:
+                print(
+                    f"[DBG] Could not resolve pubkey_prefix={prefix}. "
+                    f"cached_prefixes={list(self._contacts_by_prefix.keys())[:10]} "
+                    f"cached_contacts={len(self._contacts_by_pubkey)}"
+                )
             return None
+
+        if self.debug:
+            print(f"[DBG] Resolved DM pubkey_prefix={prefix} -> public_key={pubkey[:16]}...")
+
         return {"public_key": pubkey}
 
     # ---------------- Requester context ----------------
 
     def build_ping_reply(self, payload: Dict[str, Any], sender_name_from_text: str = "") -> str:
-        """Builds a human-readable reply with network stats for 'ping' requests using a configurable template."""
-        # 1. Identify whomever we are replying to
         who = sender_name_from_text
         if not who:
             pk = payload.get("pubkey_prefix")
             if isinstance(pk, str) and pk:
-                who = pk[:8]  # Use first 8 chars of prefix if name unavailable
+                who = pk[:8]
             else:
                 who = "unknown"
 
-        # 2. Gather network statistics
         stats_parts = []
 
-        # SNR (Signal-to-Noise Ratio)
         snr = payload.get("SNR")
         if isinstance(snr, (int, float)):
-            # Provide a basic qualitative interpretation along with the raw value
             quality = "Poor"
-            if snr > 10: quality = "Ok"
-            if snr > 20: quality = "Good"
-            if snr > 30: quality = "Great"
+            if snr > 10:
+                quality = "Ok"
+            if snr > 20:
+                quality = "Good"
+            if snr > 30:
+                quality = "Great"
             stats_parts.append(f"SNR: {snr:.0f}dB ({quality})")
 
-        # Hops (Path Length)
         path_len = payload.get("path_len")
         if isinstance(path_len, int):
-            # path_len is usually total nodes in path, including start.
-            # Hops = path_len - 1. (1 means direct).
             hops = max(0, path_len - 1)
             stats_parts.append(f"Hops: {hops}")
 
         stats_str = " | ".join(stats_parts)
 
-        # 3. Assemble final string using template
         try:
             reply = self.ping_reply_template.format(who=who, stats=stats_str)
         except Exception as e:
             print(f"[WARN] Error formatting PING_REPLY_TEMPLATE: {e}. Falling back to default.")
             reply = DEFAULT_PING_TEMPLATE.format(who=who, stats=stats_str)
 
-        # Cleanup empty brackets if stats were missing but template had brackets.
-        # This happens if template is like "[{stats}]" and stats_str is empty.
         reply = reply.replace("[]", "").strip()
-
         return reply
 
     def build_requester_context(
@@ -550,7 +567,7 @@ class ChannelLLMBot:
         for field in ["SNR", "path_len", "sender_timestamp", "txt_type"]:
             val = payload.get(field)
             if isinstance(val, (int, float)):
-                 lines.append(f"- {field.lower()}: {val}")
+                lines.append(f"- {field.lower()}: {val}")
 
         return "\n".join(lines)
 
@@ -586,13 +603,12 @@ class ChannelLLMBot:
         now = time.time()
 
         async with self._dedupe_lock:
-            # Lazy cleanup of old entries
             for k, t0 in list(self._seen_ts.items()):
                 if now - t0 > self.dedupe_window_s:
                     self._seen_ts.pop(k, None)
 
             for k, t0 in list(self._inflight.items()):
-                if now - t0 > max(self.dedupe_window_s, 30.0): # Longer timeout for inflight
+                if now - t0 > max(self.dedupe_window_s, 30.0):
                     self._inflight.pop(k, None)
 
             if key in self._seen_ts:
@@ -613,20 +629,16 @@ class ChannelLLMBot:
             self._inflight.pop(key, None)
             self._seen_ts[key] = time.time()
 
-    # Note: This method is now async because it needs to acquire the lock.
     async def get_conversation_snapshot(self, user_id: str) -> List[Tuple[str, str]]:
         async with self._history_lock:
-            # Initialize history buffer for this user if it doesn't exist
             if user_id not in self.history:
-                # We use self.history_turns which was added to __init__
                 self.history[user_id] = deque(maxlen=self.history_turns * 2)
-            
-            # Return a copy of the current history for the given user
             return list(self.history[user_id])
 
     async def append_to_history(self, user_id: str, user_msg: str, assistant_msg: str) -> None:
         async with self._history_lock:
-            # We assume get_conversation_snapshot was called first, so the buffer exists.
+            if user_id not in self.history:
+                self.history[user_id] = deque(maxlen=self.history_turns * 2)
             self.history[user_id].append(("user", user_msg))
             self.history[user_id].append(("assistant", assistant_msg))
 
@@ -658,9 +670,8 @@ class ChannelLLMBot:
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
-        
+
         chan_idx = p.get("channel_idx")
-        # Check if this message is on a channel we are monitoring
         if chan_idx not in self.monitored_channels:
             return
 
@@ -669,67 +680,49 @@ class ChannelLLMBot:
             return
 
         sender, body = self.split_sender_and_body(text)
-        # Use a default timestamp if missing to avoid dedupe issues
         sender_ts = p.get("sender_timestamp")
         if not isinstance(sender_ts, int):
             sender_ts = -1
 
-        # 1. Deduplication (fast, locked)
         dedupe_key = await self.dedupe_enter("chan", chan_idx, sender_ts, body)
         if dedupe_key is None:
             return
 
         try:
             if self.debug:
-                # Show channel name in debug print
                 chan_name = self.monitored_channels.get(chan_idx, "unknown")
                 print(f"[DBG] channel msg on '{chan_name}' (idx={chan_idx}) payload={p} gen={self.generation}")
 
-            # Check for bare "ping" command BEFORE trigger extraction
             if body.strip().lower() == "ping":
-                 # Generate a reply containing network stats
                 ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
-                # Note: build_channel_messages already prefixes with @[sender]
                 for out in self.build_channel_messages(sender, ping_reply):
                     await self.mesh.commands.send_chan_msg(chan_idx, out)
                 return
 
             user_msg = self.extract_after_trigger(body)
-
-            # If it wasn't a ping, ensure there is actual content before asking LLM
             if not user_msg:
                 return
-            
-            # Determine a unique user ID for history tracking
+
             user_id = p.get("pubkey_prefix")
             if not user_id:
-                user_id = sender # Fallback to name if no pubkey_prefix
+                user_id = sender or f"chan:{chan_idx}:unknown"
 
-            # 2. Prepare context and prompt (fast, unlocked)
-            # Get history snapshot for THIS specific user
             hist_snapshot = await self.get_conversation_snapshot(user_id)
             conversation = hist_snapshot + [("user", user_msg)]
 
             requester_ctx = self.build_requester_context("chan", p, channel_idx=chan_idx, sender_name=sender)
             sys_prompt = self.effective_system_prompt(requester_ctx)
 
-            # 3. Call LLM (SLOW, UNLOCKED)
-            # This is the most important optimization: allowing concurrent LLM calls.
             try:
                 answer = await self.llm.generate(sys_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
 
-            # 4. Update history (fast, locked)
-            # Update history for THIS specific user
             await self.append_to_history(user_id, user_msg, answer)
 
-            # 5. Send replies (relatively fast, unlocked)
-            # Sending messages sequentially to maintain order of parts back to the source channel.
             for out in self.build_channel_messages(sender, answer):
                 await self.mesh.commands.send_chan_msg(chan_idx, out)
         finally:
-            # 6. Dedupe exit (fast, locked)
             await self.dedupe_exit(dedupe_key)
 
     async def on_dm_msg(self, ev) -> None:
@@ -751,7 +744,6 @@ class ChannelLLMBot:
         if not isinstance(sender_ts, int):
             sender_ts = -1
 
-        # 1. Deduplication (fast, locked)
         dedupe_key = await self.dedupe_enter("dm", -1, sender_ts, body)
         if dedupe_key is None:
             return
@@ -760,21 +752,18 @@ class ChannelLLMBot:
             if self.debug:
                 print(f"[DBG] DM payload={p} bot_id={id(self)} gen={self.generation}")
 
-            # Check for bare "ping" command BEFORE trigger extraction
             if body.strip().lower() == "ping":
-                 # Resolve destination before sending ping reply
                 dst = await self.resolve_dm_dst(p)
                 if dst is None:
-                    # Last ditch effort to refresh contacts if not found.
                     await self.refresh_contacts_best_effort()
+                    await asyncio.sleep(0.5)
                     dst = await self.resolve_dm_dst(p)
 
                 if dst is None:
                     if self.debug:
-                        print("[DBG] Could not resolve DM destination for ping reply.")
+                        print(f"[DBG] DM reply skipped: unresolved pubkey_prefix={p.get('pubkey_prefix')} cached={len(self._contacts_by_pubkey)}")
                     return
 
-                # Generate a reply containing network stats
                 ping_reply = self.build_ping_reply(p, sender_name_from_text=sender)
                 for out in self.build_dm_messages(ping_reply):
                     await self.mesh.commands.send_msg(dst, out)
@@ -784,55 +773,42 @@ class ChannelLLMBot:
             if not user_msg:
                 return
 
-            # Resolve destination before expensive LLM call
             dst = await self.resolve_dm_dst(p)
             if dst is None:
-                # Last ditch effort to refresh contacts if not found.
-                # This is a blocking call, but necessary if we can't reply.
                 await self.refresh_contacts_best_effort()
+                await asyncio.sleep(0.5)
                 dst = await self.resolve_dm_dst(p)
 
             if dst is None:
                 if self.debug:
-                    print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
+                    print(f"[DBG] Could not resolve DM destination. payload={p}")
+                    print(f"[DBG] DM reply skipped: unresolved pubkey_prefix={p.get('pubkey_prefix')} cached={len(self._contacts_by_pubkey)}")
                 return
-            
-            # Determine a unique user ID for history tracking
+
             user_id = p.get("pubkey_prefix")
             if not user_id:
-                # Fallback for DMs is trickier, sender name is often empty.
-                # Use full pubkey if available, otherwise we can't track history reliably.
                 user_id = p.get("public_key")
 
             if not user_id:
-                if self.debug:
-                     print("[DBG] Cannot determine user ID for history tracking in DM.")
-                # Proceed without history if user can't be identified
                 conversation = [("user", user_msg)]
             else:
-                # 2. Prepare context and prompt (fast, unlocked)
-                # Get history snapshot for THIS specific user
                 hist_snapshot = await self.get_conversation_snapshot(user_id)
                 conversation = hist_snapshot + [("user", user_msg)]
 
             requester_ctx = self.build_requester_context("dm", p, sender_name=sender)
             sys_prompt = self.effective_system_prompt(requester_ctx)
 
-            # 3. Call LLM (SLOW, UNLOCKED)
             try:
                 answer = await self.llm.generate(sys_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
 
-            # 4. Update history (fast, locked)
             if user_id:
                 await self.append_to_history(user_id, user_msg, answer)
 
-            # 5. Send replies (relatively fast, unlocked)
             for out in self.build_dm_messages(answer):
                 await self.mesh.commands.send_msg(dst, out)
         finally:
-            # 6. Dedupe exit (fast, locked)
             await self.dedupe_exit(dedupe_key)
 
 
@@ -863,17 +839,14 @@ async def create_mesh_connection() -> MeshCore:
 
         print(f"[INFO] MeshCore transport=serial port={serial_port} baud={baud}")
 
-        # Try known factory methods for serial connection
         for factory_method in ["create_serial", "create_uart", "create_usb", "create_serial_port"]:
             if hasattr(MeshCore, factory_method):
                 fn = getattr(MeshCore, factory_method)
-                # Some methods might not take baud rate, but most do.
                 try:
                     mesh = await fn(serial_port, baud, auto_reconnect=False)
                 except TypeError:
-                     # Fallback for methods that might not take baud
                     mesh = await fn(serial_port, auto_reconnect=False)
-                
+
                 if mesh is None:
                     raise RuntimeError(f"MeshCore.{factory_method}() returned None")
                 return mesh
@@ -890,15 +863,7 @@ async def create_mesh_connection() -> MeshCore:
 # run loop
 # ---------------------------
 
-_CURRENT_GENERATION = 0
-
-
-def current_generation() -> int:
-    return _CURRENT_GENERATION
-
-
 async def run_bot_once(generation: int, llm: LLMClient) -> None:
-    # Read comma-separated list of channels
     channel_names_str = env_str("MESHCORE_CHANNELS", "#avl-ai")
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
@@ -911,11 +876,8 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
     include_requester_context = env_bool("INCLUDE_REQUESTER_CONTEXT", True)
     ping_reply_template = env_str("PING_REPLY_TEMPLATE", DEFAULT_PING_TEMPLATE)
 
-    # LLM client creation is now moved to main()
-
     print("[INFO] connecting to MeshCore...")
     mesh = await create_mesh_connection()
-    # Give the connection a moment to settle
     await asyncio.sleep(1.0)
 
     if mesh is None:
@@ -923,7 +885,6 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
 
     await mesh.start_auto_message_fetching()
 
-    # Find all requested channels
     want_names = {normalize_channel_name(n) for n in channel_names_str.split(",") if n.strip()}
     monitored_channels: Dict[int, str] = {}
 
@@ -935,19 +896,21 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
         payload = ev.payload or {}
         if not isinstance(payload, dict):
             continue
-        
+
         name_raw = payload.get("channel_name") or payload.get("name") or payload.get("chan_name") or ""
         norm_name = normalize_channel_name(str(name_raw))
-        
+
         if norm_name and norm_name in want_names:
-             # Store the original name for display purposes
-             monitored_channels[i] = str(name_raw)
-             print(f"[OK] Found required channel: '{name_raw}' at index {i}")
+            monitored_channels[i] = str(name_raw)
+            print(f"[OK] Found required channel: '{name_raw}' at index {i}")
 
     if not monitored_channels:
-         print(f"[ERROR] None of the requested channels ({want_names}) found in first {scan_max} slots.")
-         await mesh.aclose()
-         return
+        print(f"[ERROR] None of the requested channels ({want_names}) found in first {scan_max} slots.")
+        if hasattr(mesh, "aclose"):
+            await mesh.aclose()
+        elif hasattr(mesh, "close"):
+            mesh.close()
+        return
 
     bot = ChannelLLMBot(
         mesh=mesh,
@@ -963,6 +926,8 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
         ping_reply_template=ping_reply_template,
         generation=generation,
         current_generation_ref=current_generation,
+        contacts_by_pubkey=_SHARED_CONTACTS_BY_PUBKEY,
+        contacts_by_prefix=_SHARED_CONTACTS_BY_PREFIX,
     )
 
     print(f"[BOOT] bot instance id={id(bot)} generation={generation}")
@@ -991,13 +956,11 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
 
     mesh.subscribe(EventType.DISCONNECTED, disconnected_handler)
 
-    # Grab the first found channel index to use for health monitoring
     health_check_idx = next(iter(monitored_channels.keys()))
 
     async def health_monitor() -> None:
         while not disconnect_future.done():
             try:
-                # Active health check on one of the monitored channels
                 ev = await mesh.commands.get_channel(health_check_idx)
                 if ev is None or ev.type == EventType.ERROR:
                     print(f"[WARN] health check failed on channel idx {health_check_idx}; forcing reconnect")
@@ -1021,16 +984,20 @@ async def run_bot_once(generation: int, llm: LLMClient) -> None:
             await monitor_task
         except asyncio.CancelledError:
             pass
-        
+
         print("[INFO] Closing MeshCore connection...")
-        await mesh.aclose()
-        # LLM client aclose() is now handled in main()
+        try:
+            if hasattr(mesh, "aclose"):
+                await mesh.aclose()
+            elif hasattr(mesh, "close"):
+                mesh.close()
+        except Exception as e:
+            print(f"[WARN] error while closing MeshCore connection: {e}")
 
 
 async def main() -> None:
     global _CURRENT_GENERATION
 
-    # Initialize LLM client once, outside the reconnect loop.
     backend = env_str("LLM_BACKEND", "gemini").lower()
     print(f"[LLM] Initializing backend={backend}")
 
@@ -1064,9 +1031,7 @@ async def main() -> None:
             try:
                 _CURRENT_GENERATION += 1
                 gen = _CURRENT_GENERATION
-                # Pass the persistent LLM client instance
                 await run_bot_once(gen, llm)
-                # If run_bot_once returns normally, reset delay
                 delay = base_delay
             except asyncio.CancelledError:
                 raise
@@ -1075,10 +1040,8 @@ async def main() -> None:
 
             print(f"[INFO] reconnecting in {delay}s...")
             await asyncio.sleep(delay)
-            # Exponential backoff
             delay = min(delay * 2, max_delay)
     finally:
-        # Ensure LLM client is closed on application exit
         print("[INFO] Closing LLM client...")
         await llm.aclose()
 
