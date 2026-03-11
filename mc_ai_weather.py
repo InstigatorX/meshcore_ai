@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
-+ listens to channel messages AND direct messages
++ listens to multiple channels AND direct messages
 + Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
 + Configurable polling for US National Weather Service (NWS) severe weather alerts.
 
@@ -73,8 +73,11 @@ def chunk_text(text: str, max_len: int) -> List[str]:
     return chunks
 
 
-async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: int = 16) -> int:
-    want = normalize_channel_name(channel_name)
+async def resolve_channels(mesh: MeshCore, channel_names: List[str], max_channels: int = 16) -> Dict[int, str]:
+    """Finds the index of multiple channel names. Returns a dict of {idx: normalized_name}."""
+    want = {normalize_channel_name(c) for c in channel_names if c.strip()}
+    found: Dict[int, str] = {}
+    
     for idx in range(max_channels):
         ev = await mesh.commands.get_channel(idx)
         if ev.type == EventType.ERROR:
@@ -82,11 +85,21 @@ async def resolve_channel_idx(mesh: MeshCore, channel_name: str, max_channels: i
         payload = ev.payload or {}
         if not isinstance(payload, dict):
             continue
+            
         got_raw = payload.get("channel_name") or payload.get("name") or payload.get("chan_name") or ""
         got = normalize_channel_name(str(got_raw))
-        if got == want:
-            return idx
-    raise RuntimeError(f"Channel '{channel_name}' not found in first {max_channels} channel slots")
+        
+        if got in want:
+            found[idx] = got
+
+    missing = want - set(found.values())
+    if missing:
+        print(f"[WARN] Could not find requested channels: {missing} in first {max_channels} slots")
+        
+    if not found:
+        raise RuntimeError(f"None of the requested channels {channel_names} were found on this node!")
+        
+    return found
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -202,8 +215,7 @@ class ChannelLLMBot:
         self,
         mesh: MeshCore,
         llm: LLMClient,
-        channel_idx: int,
-        channel_label: str,
+        channel_map: Dict[int, str],
         trigger: str,
         max_reply_chars: int,
         history_turns: int,
@@ -216,8 +228,7 @@ class ChannelLLMBot:
     ):
         self.mesh = mesh
         self.llm = llm
-        self.channel_idx = channel_idx
-        self.channel_label = channel_label
+        self.channel_map = channel_map  # {idx: normalized_name}
         self.trigger = trigger
         self.max_reply_chars = max_reply_chars
         self.debug = debug
@@ -231,8 +242,9 @@ class ChannelLLMBot:
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
+        # Separate history per channel index
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
-            channel_idx: deque(maxlen=history_turns * 2)
+            idx: deque(maxlen=history_turns * 2) for idx in channel_map.keys()
         }
 
         # serialize LLM calls and mesh send bursts
@@ -325,7 +337,6 @@ class ChannelLLMBot:
             return "No weather location specified."
         
         loc_encoded = urllib.parse.quote(location)
-        # wttr.in custom format: %l=Location, %c=Condition, %t=Temp, %w=Wind, %h=Humidity
         url = f"https://wttr.in/{loc_encoded}?format=%l:+%c+%t,+Wind+%w,+Hum+%h"
 
         try:
@@ -353,7 +364,6 @@ class ChannelLLMBot:
         if not self.weather_times or not self.weather_location:
             return
 
-        # Parse times into tuples of (hour, minute)
         parsed_times = []
         for t_str in self.weather_times:
             parts = t_str.split(":")
@@ -361,8 +371,6 @@ class ChannelLLMBot:
                 parsed_times.append((int(parts[0]), int(parts[1])))
 
         if not parsed_times:
-            if self.debug:
-                print("[DBG] No valid weather times found in schedule.")
             return
 
         last_sent_min = -1
@@ -377,29 +385,27 @@ class ChannelLLMBot:
                 if self.debug:
                     print(f"[DBG] Triggering scheduled weather for {current_time}")
                 
-                # Fetch outside lock
                 ans = await self.fetch_weather(self.weather_location)
                 
-                # Send inside lock to serialize with LLM replies
+                # Send to ALL monitored channels
                 async with self._llm_lock:
                     parts = chunk_text(ans, self.max_reply_chars)
-                    for i, part in enumerate(parts, start=1):
-                        msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                        await self.mesh.commands.send_chan_msg(self.channel_idx, msg)
-                        await asyncio.sleep(1)
+                    for ch_idx in self.channel_map.keys():
+                        for i, part in enumerate(parts, start=1):
+                            msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                            await self.mesh.commands.send_chan_msg(ch_idx, msg)
+                            await asyncio.sleep(2) # Prevent overwhelming network with burst
 
-            # Check every 10 seconds to not miss the minute mark
             await asyncio.sleep(10)
 
-    async def weather_alerts_loop(self, area: str, interval_m: float) -> None:
+    async def weather_alerts_loop(self, zones: str, interval_m: float) -> None:
         """Polls the NWS API periodically for new weather alerts."""
-        if not area or interval_m <= 0:
+        if not zones or interval_m <= 0:
             return
 
         interval_s = interval_m * 60.0
-        # The NWS API requires a User-Agent header
         headers = {"User-Agent": "MeshCore-Weather-Alert-Bot/1.0 (https://github.com/)"}
-        url = f"https://api.weather.gov/alerts/active?zone={urllib.parse.quote(area)}"
+        url = f"https://api.weather.gov/alerts/active?zone={urllib.parse.quote(zones)}"
 
         while True:
             try:
@@ -418,7 +424,6 @@ class ChannelLLMBot:
                     
                     self._seen_alerts.add(alert_id)
                     
-                    # Prevent boundless growth of seen set
                     if len(self._seen_alerts) > 500:
                         self._seen_alerts.clear()
                         self._seen_alerts.add(alert_id)
@@ -430,12 +435,14 @@ class ChannelLLMBot:
                     if self.debug:
                         print(f"[DBG] New Alert Found: {msg}")
 
+                    # Broadcast alert to all mapped channels
                     async with self._llm_lock:
                         parts = chunk_text(msg, self.max_reply_chars)
-                        for i, part in enumerate(parts, start=1):
-                            out_msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                            await self.mesh.commands.send_chan_msg(self.channel_idx, out_msg)
-                            await asyncio.sleep(1)
+                        for ch_idx in self.channel_map.keys():
+                            for i, part in enumerate(parts, start=1):
+                                out_msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                                await self.mesh.commands.send_chan_msg(ch_idx, out_msg)
+                                await asyncio.sleep(2)
 
             except Exception as e:
                 if self.debug:
@@ -482,8 +489,8 @@ class ChannelLLMBot:
             self._seen_ts[key] = now
             return False
 
-    def build_conversation(self, user_text: str) -> List[Tuple[str, str]]:
-        hist = list(self.history[self.channel_idx])
+    def build_conversation(self, ch_idx: int, user_text: str) -> List[Tuple[str, str]]:
+        hist = list(self.history[ch_idx])
         return hist + [("user", user_text)]
 
     def format_chan_reply(self, sender: str, msg: str) -> str:
@@ -501,7 +508,9 @@ class ChannelLLMBot:
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
-        if p.get("channel_idx") != self.channel_idx:
+            
+        ch_idx = p.get("channel_idx")
+        if ch_idx not in self.channel_map:
             return
 
         text = p.get("text")
@@ -513,7 +522,7 @@ class ChannelLLMBot:
         if not isinstance(sender_ts, int):
             sender_ts = -1
 
-        if await self.dedupe_drop("chan", self.channel_idx, sender_ts, body):
+        if await self.dedupe_drop("chan", ch_idx, sender_ts, body):
             return
 
         # On-Demand Weather Check
@@ -523,7 +532,6 @@ class ChannelLLMBot:
             req_loc = body[len(self.weather_trigger):].strip()
             target_loc = req_loc if req_loc else self.weather_location
             
-            # Fetch outside lock so we don't block other tasks
             ans = await self.fetch_weather(target_loc)
             
             async with self._llm_lock:
@@ -532,7 +540,7 @@ class ChannelLLMBot:
                     msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
                     out = self.format_chan_reply(sender, msg)
                     if out:
-                        await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+                        await self.mesh.commands.send_chan_msg(ch_idx, out)
             return
 
         # LLM Trigger Check
@@ -544,25 +552,25 @@ class ChannelLLMBot:
             if user.lower() == "ping":
                 out = self.format_chan_reply(sender, "pong")
                 if out:
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+                    await self.mesh.commands.send_chan_msg(ch_idx, out)
                 return
 
-            self.history[self.channel_idx].append(("user", user))
-            conversation = self.build_conversation(user)
+            self.history[ch_idx].append(("user", user))
+            conversation = self.build_conversation(ch_idx, user)
 
             try:
                 answer = await self.llm.generate(self.system_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
 
-            self.history[self.channel_idx].append(("assistant", answer))
+            self.history[ch_idx].append(("assistant", answer))
 
             parts = chunk_text(answer, self.max_reply_chars)
             for i, part in enumerate(parts, start=1):
                 msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
                 out = self.format_chan_reply(sender, msg)
                 if out:
-                    await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+                    await self.mesh.commands.send_chan_msg(ch_idx, out)
 
     async def on_dm_msg(self, ev) -> None:
         p = ev.payload or {}
@@ -621,11 +629,22 @@ class ChannelLLMBot:
                     await self.mesh.commands.send_msg(dst, out)
                 return
 
-            conversation = self.build_conversation(user)
+            # Note: For DM history we could implement a separate dict keyed by pubkey,
+            # but for simplicity we treat DMs opaquely and pass 0 for history.
+            # You can adapt this if you want persistent history in DMs.
+            dummy_idx = 999 
+            if dummy_idx not in self.history:
+                self.history[dummy_idx] = deque(maxlen=self.history[list(self.channel_map.keys())[0]].maxlen)
+            
+            self.history[dummy_idx].append(("user", user))
+            conversation = self.build_conversation(dummy_idx, user)
+            
             try:
                 answer = await self.llm.generate(self.system_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
+
+            self.history[dummy_idx].append(("assistant", answer))
 
             parts = chunk_text(answer, self.max_reply_chars)
             for i, part in enumerate(parts, start=1):
@@ -668,7 +687,8 @@ async def create_mesh_connection() -> MeshCore:
 
 
 async def main() -> None:
-    channel_name = env_str("MESHCORE_CHANNEL_NAME", "#avl-ai")
+    channels_raw = env_str("MESHCORE_CHANNELS", "#avl-ai")
+    target_channels = [c.strip() for c in channels_raw.split(",") if c.strip()]
     scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
@@ -684,8 +704,8 @@ async def main() -> None:
     weather_times = [t.strip() for t in weather_times_raw.split(",") if t.strip()]
     weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
     
-    # Alert configurations
-    alerts_area = env_str("WEATHER_ALERTS_NWS_AREA", "")
+    # Alert configurations (Renamed to NWS_ZONES based on NWS API changes)
+    alerts_zones = env_str("WEATHER_ALERTS_NWS_ZONES", "")
     alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
@@ -714,22 +734,17 @@ async def main() -> None:
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
-    chan_idx = await resolve_channel_idx(mesh, channel_name, max_channels=scan_max)
+    # Resolve all requested channels into a dictionary {index: name}
+    channel_map = await resolve_channels(mesh, target_channels, max_channels=scan_max)
 
     print("[OK] Channel map:")
-    for i in range(scan_max):
-        ev = await mesh.commands.get_channel(i)
-        if ev.type == EventType.ERROR:
-            continue
-        payload = ev.payload or {}
-        if isinstance(payload, dict):
-            print(f"  idx={i} -> {payload.get('channel_name')}")
+    for idx, name in channel_map.items():
+        print(f"  idx={idx} -> {name}")
 
     bot = ChannelLLMBot(
         mesh=mesh,
         llm=llm,
-        channel_idx=chan_idx,
-        channel_label=channel_name,
+        channel_map=channel_map,
         trigger=trigger,
         max_reply_chars=max_reply_chars,
         history_turns=history_turns,
@@ -759,12 +774,12 @@ async def main() -> None:
         print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}")
         
     # Start NWS weather alerts polling task if configured
-    if alerts_area and alerts_interval_m > 0:
-        asyncio.create_task(bot.weather_alerts_loop(alerts_area, alerts_interval_m))
-        print(f"[OK] NWS weather alerts polling enabled: Area='{alerts_area}', Interval={alerts_interval_m}m")
+    if alerts_zones and alerts_interval_m > 0:
+        asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m))
+        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
-    print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
-    print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
+    print(f"[OK] Connected | listening on channels {list(channel_map.values())} | AI trigger='{trigger}'")
+    print(f"[OK] Listening for DMs via CONTACT_MSG_RECV")
     print(f"[OK] On-demand weather enabled. Trigger='{weather_trigger}' (e.g. '{weather_trigger}' or '{weather_trigger} Paris')")
     print(f"[LLM] backend={backend}")
     if backend == "gemini":
