@@ -28,6 +28,8 @@ services:
       RECONNECT_MAX_DELAY_S: "60"  # Max exponential backoff delay
       # SYSTEM_PROMPT: "Optional override for default system prompt."
       WEATHER_LOCATION: "AVL"
+      WEATHER_SCHEDULED_TIMES: "06:00, 13:00, 20:00" # Comma-separated list of 24-hour times (e.g., "08:00, 13:00, 20:00"). Leave blank to disable scheduled broadcasts.
+      WEATHER_TRIGGER: "!weather" # The command to trigger on-demand weather (Defaults to "!weather").
       WEATHER_ALERTS_NWS_ZONES: "NCZ053,NCC021" # The NWS area code to monitor (e.g., "NY" for New York State, "TX" for Texas, or a specific zone like "NYZ076").
       WEATHER_ALERTS_POLL_INTERVAL_M: "15" # How often to check for alerts, in minutes (defaults to 15.0).
 
