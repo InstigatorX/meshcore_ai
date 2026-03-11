@@ -5,8 +5,9 @@ MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
 + Includes today's forecast (High/Low/Rain chance)
 + Configurable polling for US National Weather Service (NWS) severe weather alerts.
-+ Global `!ping` command with configurable template (returns SNR, RSSI, and Hops).
++ Global `!ping` command for testing connectivity (returns SNR, RSSI, and Hops).
 + Global `!help` command listing available triggers based on context.
++ Watchdog supervisor loop to automatically recover from dropped TCP/Serial connections.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts. DMs support all commands.
@@ -125,6 +126,9 @@ DEFAULT_SYSTEM_PROMPT = (
 class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
+        
+    async def aclose(self) -> None:
+        pass
 
 
 class GeminiClient(LLMClient):
@@ -592,7 +596,6 @@ class ChannelLLMBot:
         except Exception as e:
             if self.debug:
                 print(f"[DBG] PING_TEMPLATE formatting error: {e}")
-            # Safe fallback if user makes a typo in template variables
             return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
@@ -786,7 +789,8 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
+        # We explicitly use auto_reconnect=False here, as our supervisor loop handles this better
+        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -795,12 +799,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=True)
+                return await fn(serial_port, baud, auto_reconnect=False)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -844,6 +848,7 @@ async def main() -> None:
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
+    # Initialize LLM Client once (outside of the supervisor loop)
     llm: LLMClient
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
@@ -865,77 +870,122 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
-    mesh = await create_mesh_connection()
-    await mesh.start_auto_message_fetching()
+    # --------------------------------------------------------------------------
+    # Supervisor Watchdog Loop
+    # Handles drops by completely tearing down the mesh connection and restarting
+    # --------------------------------------------------------------------------
+    while True:
+        mesh = None
+        bg_tasks = []
+        try:
+            print("[INFO] Establishing connection to node...")
+            mesh = await create_mesh_connection()
+            await mesh.start_auto_message_fetching()
 
-    # Resolve requested channels into dictionaries {index: name}
-    ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
-    weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
+            # Resolve requested channels into dictionaries {index: name}
+            ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
+            weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
 
-    print("[OK] AI Channel map:")
-    if not ai_channel_map:
-        print("  (None configured)")
-    for idx, name in ai_channel_map.items():
-        print(f"  idx={idx} -> {name}")
+            print("[OK] AI Channel map:")
+            if not ai_channel_map:
+                print("  (None configured)")
+            for idx, name in ai_channel_map.items():
+                print(f"  idx={idx} -> {name}")
 
-    print("[OK] Weather Channel map:")
-    if not weather_channel_map:
-        print("  (None configured)")
-    for idx, name in weather_channel_map.items():
-        print(f"  idx={idx} -> {name}")
+            print("[OK] Weather Channel map:")
+            if not weather_channel_map:
+                print("  (None configured)")
+            for idx, name in weather_channel_map.items():
+                print(f"  idx={idx} -> {name}")
 
-    bot = ChannelLLMBot(
-        mesh=mesh,
-        llm=llm,
-        ai_channels=ai_channel_map,
-        weather_channels=weather_channel_map,
-        trigger=trigger,
-        ping_trigger=ping_trigger,
-        help_trigger=help_trigger,
-        ping_template=ping_template,
-        max_reply_chars=max_reply_chars,
-        history_turns=history_turns,
-        dedupe_window_s=dedupe_window_s,
-        debug=debug,
-        system_prompt=system_prompt,
-        weather_location=weather_location,
-        weather_times=weather_times,
-        weather_trigger=weather_trigger,
-        weather_units=weather_units
-    )
+            bot = ChannelLLMBot(
+                mesh=mesh,
+                llm=llm,
+                ai_channels=ai_channel_map,
+                weather_channels=weather_channel_map,
+                trigger=trigger,
+                ping_trigger=ping_trigger,
+                help_trigger=help_trigger,
+                ping_template=ping_template,
+                max_reply_chars=max_reply_chars,
+                history_turns=history_turns,
+                dedupe_window_s=dedupe_window_s,
+                debug=debug,
+                system_prompt=system_prompt,
+                weather_location=weather_location,
+                weather_times=weather_times,
+                weather_trigger=weather_trigger,
+                weather_units=weather_units
+            )
 
-    # Contacts/cache feeders
-    mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
-    mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
-    mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
+            # Contacts/cache feeders
+            mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
+            mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
+            mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
 
-    # Message listeners
-    mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
-    mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
+            # Message listeners
+            mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
+            mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
 
-    # Try to warm contacts cache
-    await bot.refresh_contacts_best_effort()
+            # Try to warm contacts cache
+            await bot.refresh_contacts_best_effort()
 
-    # Start weather schedule background task if configured
-    if weather_times and weather_location and weather_channel_map:
-        asyncio.create_task(bot.scheduled_weather_loop())
-        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
-        
-    # Start NWS weather alerts polling task if configured
-    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
-        asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m))
-        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
+            # Start background tasks
+            if weather_times and weather_location and weather_channel_map:
+                bg_tasks.append(asyncio.create_task(bot.scheduled_weather_loop()))
+                print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
+                
+            if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
+                bg_tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m)))
+                print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
-    print(f"\n[OK] Connected and Listening.")
-    print(f"[LLM] Backend={backend}")
-    print(f"--- COMMANDS ---")
-    print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
-    print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
-    print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
-    print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
+            print(f"\n[OK] Connected and Listening.")
+            print(f"[LLM] Backend={backend}")
+            print(f"--- COMMANDS ---")
+            print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
+            print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
+            print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
+            print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
 
-    await asyncio.sleep(float("inf"))
+            # Health check loop
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    # Request channel 0 to prove the node is still actively responding over TCP/Serial
+                    await asyncio.wait_for(mesh.commands.get_channel(0), timeout=15.0)
+                except asyncio.TimeoutError:
+                    print("\n[ERR] Node health check timed out. Connection is dead.")
+                    break # Break inner loop to trigger supervisor restart
+                except Exception as e:
+                    print(f"\n[ERR] Node health check failed: {e}")
+                    break # Break inner loop to trigger supervisor restart
 
+        except Exception as e:
+            if not isinstance(e, SystemExit):
+                print(f"\n[ERR] Fatal connection error: {e}")
+            else:
+                # Let bad config errors kill the script immediately
+                raise
+
+        finally:
+            print("[INFO] Cleaning up tasks and connection...")
+            for t in bg_tasks:
+                t.cancel()
+            
+            if mesh:
+                try:
+                    if hasattr(mesh, "disconnect"):
+                        await getattr(mesh, "disconnect")()
+                    elif hasattr(mesh, "close"):
+                        await getattr(mesh, "close")()
+                except Exception:
+                    pass
+
+        print("[INFO] Supervisor waiting 10 seconds before attempting to reconnect...\n")
+        await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user.")
