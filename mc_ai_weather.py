@@ -5,7 +5,8 @@ MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
 + Includes today's forecast (High/Low/Rain chance)
 + Configurable polling for US National Weather Service (NWS) severe weather alerts.
-+ Global `!ping` command for testing connectivity (returns SNR, RSSI, and Hops).
++ Global `!ping` command with configurable template (returns SNR, RSSI, and Hops).
++ Global `!help` command listing available triggers based on context.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts. DMs support all commands.
@@ -227,6 +228,8 @@ class ChannelLLMBot:
         weather_channels: Dict[int, str],
         trigger: str,
         ping_trigger: str,
+        help_trigger: str,
+        ping_template: str,
         max_reply_chars: int,
         history_turns: int,
         dedupe_window_s: float,
@@ -241,8 +244,10 @@ class ChannelLLMBot:
         self.llm = llm
         self.ai_channels = ai_channels            # {idx: name}
         self.weather_channels = weather_channels  # {idx: name}
-        self.trigger = trigger
+        self.trigger = trigger.strip()
         self.ping_trigger = ping_trigger.strip()
+        self.help_trigger = help_trigger.strip()
+        self.ping_template = ping_template
         self.max_reply_chars = max_reply_chars
         self.debug = debug
         self.dedupe_window_s = dedupe_window_s
@@ -254,7 +259,7 @@ class ChannelLLMBot:
         self.weather_units = weather_units.upper()
         self._seen_alerts: Set[str] = set()
 
-        self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
+        self.trigger_re = re.compile(rf"(^|\s+){re.escape(self.trigger)}(\s+|$)", re.IGNORECASE)
 
         # Separate AI history per AI channel index
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
@@ -548,44 +553,47 @@ class ChannelLLMBot:
     def format_dm_reply(self, msg: str) -> str:
         return (msg or "").strip()
 
+    def get_help_string(self, is_ai: bool, is_weather: bool) -> str:
+        """Returns dynamically generated help text based on active features for the channel."""
+        cmds = [self.help_trigger, self.ping_trigger]
+        if is_weather:
+            cmds.append(f"{self.weather_trigger} [loc]")
+        if is_ai:
+            cmds.append(f"{self.trigger} [msg]")
+        return "Commands: " + ", ".join(cmds)
+
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
-        """Extracts network telemetry from the packet payload."""
+        """Extracts network telemetry from the payload and formats it using the template."""
         
-        # Check standard meshcore keys (some wrappers use uppercase 'SNR' and 'path_len' instead of hopLimit)
         snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
         rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
         path_len = p.get("path_len")
         
-        metrics = []
-        if snr is not None:
-            metrics.append(f"SNR: {snr}")
-        if rssi is not None:
-            metrics.append(f"RSSI: {rssi}dBm")
-            
+        hops = None
         if path_len is not None:
-            metrics.append(f"Hops: {path_len}")
+            hops = path_len
         else:
-            # Fallback for other wrappers
             hop_limit = p.get("hopLimit") or p.get("hop_limit")
             hop_start = p.get("hopStart") or p.get("hop_start")
             if hop_limit is not None:
                 try:
                     hl = int(hop_limit)
                     hs = int(hop_start) if hop_start is not None else hl
-                    if hs >= hl:
-                        metrics.append(f"Hops: {hs - hl}")
-                    else:
-                        metrics.append(f"HopLimit: {hl}")
+                    hops = (hs - hl) if hs >= hl else 0
                 except (ValueError, TypeError):
-                    metrics.append(f"HopLimit: {hop_limit}")
+                    pass
 
-        if not metrics:
+        safe_snr = snr if snr is not None else "?"
+        safe_rssi = rssi if rssi is not None else "?"
+        safe_hops = hops if hops is not None else "?"
+
+        try:
+            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
+        except Exception as e:
             if self.debug:
-                print(f"[DBG] No telemetry found! Payload keys: {list(p.keys())}")
-                print(f"[DBG] Full Payload: {p}")
-            return "pong"
-            
-        return "pong [" + ", ".join(metrics) + "]"
+                print(f"[DBG] PING_TEMPLATE formatting error: {e}")
+            # Safe fallback if user makes a typo in template variables
+            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
 
@@ -616,7 +624,16 @@ class ChannelLLMBot:
 
         body_lower = body.lower()
 
-        # 0. Global Ping Check (Works on any monitored channel)
+        # 0. Global Help Check
+        h_trigger = self.help_trigger.lower()
+        if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
+            reply_text = self.get_help_string(is_ai_chan, is_weather_chan)
+            out = self.format_chan_reply(sender, reply_text)
+            if out:
+                await self.mesh.commands.send_chan_msg(ch_idx, out)
+            return
+
+        # 1. Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
             reply_text = self.get_telemetry_string(p)
@@ -625,7 +642,7 @@ class ChannelLLMBot:
                 await self.mesh.commands.send_chan_msg(ch_idx, out)
             return
 
-        # 1. On-Demand Weather Check (Only in Weather Channels)
+        # 2. On-Demand Weather Check (Only in Weather Channels)
         if is_weather_chan:
             w_trigger = self.weather_trigger.lower()
             if body_lower == w_trigger or body_lower.startswith(w_trigger + " "):
@@ -643,21 +660,13 @@ class ChannelLLMBot:
                             await self.mesh.commands.send_chan_msg(ch_idx, out)
                 return
 
-        # 2. Check for LLM Trigger (Only in AI Channels)
+        # 3. Check for LLM Trigger (Only in AI Channels)
         if is_ai_chan:
             user = self.extract_after_trigger(body)
             if not user:
                 return
 
             async with self._llm_lock:
-                # Retain fallback `!ai ping` functionality
-                if user.lower() == "ping":
-                    reply_text = self.get_telemetry_string(p)
-                    out = self.format_chan_reply(sender, reply_text)
-                    if out:
-                        await self.mesh.commands.send_chan_msg(ch_idx, out)
-                    return
-
                 self.history[ch_idx].append(("user", user))
                 conversation = self.build_conversation(ch_idx, user)
 
@@ -705,6 +714,15 @@ class ChannelLLMBot:
 
         body_lower = body.lower()
 
+        # Global Help Check (DMs support everything)
+        h_trigger = self.help_trigger.lower()
+        if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
+            reply_text = self.get_help_string(is_ai=True, is_weather=True)
+            out = self.format_dm_reply(reply_text)
+            if out:
+                await self.mesh.commands.send_msg(dst, out)
+            return
+
         # Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
@@ -737,14 +755,6 @@ class ChannelLLMBot:
             return
 
         async with self._llm_lock:
-            # Fallback `!ai ping`
-            if user.lower() == "ping":
-                reply_text = self.get_telemetry_string(p)
-                out = self.format_dm_reply(reply_text)
-                if out:
-                    await self.mesh.commands.send_msg(dst, out)
-                return
-
             dummy_idx = 999 
             if dummy_idx not in self.history:
                 ml = self.history[list(self.ai_channels.keys())[0]].maxlen if self.ai_channels else 12
@@ -812,6 +822,9 @@ async def main() -> None:
 
     trigger = env_str("AI_TRIGGER", "!ai").strip()
     ping_trigger = env_str("PING_TRIGGER", "!ping").strip()
+    help_trigger = env_str("HELP_TRIGGER", "!help").strip()
+    ping_template = env_str("PING_TEMPLATE", "pong [SNR: {snr}, RSSI: {rssi}dBm, Hops: {hops}]")
+    
     max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
@@ -878,6 +891,8 @@ async def main() -> None:
         weather_channels=weather_channel_map,
         trigger=trigger,
         ping_trigger=ping_trigger,
+        help_trigger=help_trigger,
+        ping_template=ping_template,
         max_reply_chars=max_reply_chars,
         history_turns=history_turns,
         dedupe_window_s=dedupe_window_s,
@@ -914,9 +929,10 @@ async def main() -> None:
     print(f"\n[OK] Connected and Listening.")
     print(f"[LLM] Backend={backend}")
     print(f"--- COMMANDS ---")
-    print(f" [TEST] Ping Check (Any channel or DM): '{ping_trigger}' (Expect: pong [telemetry])")
-    print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello' (Expect: AI response)")
-    print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris' (Expect: Forecast)\n")
+    print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
+    print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
+    print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
+    print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
 
     await asyncio.sleep(float("inf"))
 
