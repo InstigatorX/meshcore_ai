@@ -979,7 +979,7 @@ async def run_bot_once(llm: LLMClient) -> None:
             except asyncio.TimeoutError:
                 pass
 
-    health_task = asyncio.create_task(health_monitor())
+    health_task = None
 
     reason = "unknown"
     try:
@@ -992,16 +992,15 @@ async def run_bot_once(llm: LLMClient) -> None:
 
         for task in background_tasks:
             task.cancel()
-        health_task.cancel()
-
-        for task in background_tasks:
+        if health_task is not None:
+            health_task.cancel()
             try:
-                await task
+                await health_task
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 if debug:
-                    print(f"[DBG] background task ended with error: {e}")
+                    print(f"[DBG] health task ended with error: {e}")
 
         try:
             await health_task
