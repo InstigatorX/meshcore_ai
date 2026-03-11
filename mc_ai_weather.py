@@ -282,6 +282,10 @@ class ChannelLLMBot:
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
+        
+        # Telemetry Cache for intercepting raw radio metrics
+        self._telemetry_cache: Dict[int, Dict[str, Any]] = {}
+        self._last_telemetry: Dict[str, Any] = {}
 
     # ---------------- Contacts ----------------
 
@@ -568,76 +572,50 @@ class ChannelLLMBot:
         return "Commands: " + ", ".join(cmds)
 
     def get_telemetry_string(self, ev: Any) -> str:
-        """Extracts network telemetry from anywhere in the event payload/object."""
-        snr, rssi, hops = None, None, None
+        """Extracts network telemetry using the cached raw message data."""
+        
+        # Parse the decoded CHAN/DM payload
+        p = getattr(ev, "payload", {})
+        if hasattr(p, "to_dict"): p = p.to_dict()
+        elif hasattr(p, "__dict__"): p = p.__dict__
+        if not isinstance(p, dict): p = {}
 
-        # Helper to safely pull a value from either a dict or an object attribute
-        def extract_value(obj, keys_to_find):
-            if isinstance(obj, dict):
-                for k in keys_to_find:
-                    if k in obj and obj[k] is not None:
-                        return obj[k]
-            else:
-                for k in keys_to_find:
-                    if hasattr(obj, k) and getattr(obj, k) is not None:
-                        return getattr(obj, k)
-            return None
-
-        snr_keys = ["SNR", "snr", "rxSnr", "rx_snr"]
-        rssi_keys = ["RSSI", "rssi", "rxRssi", "rx_rssi"]
-        hops_keys = ["path_len", "hops"]
-
-        # Gather every possible place the telemetry data might be hiding
-        sources = [ev]
-        if hasattr(ev, "payload"):
-            sources.append(ev.payload)
-        if hasattr(ev, "packet"):
-            sources.append(ev.packet)
-            if isinstance(ev.packet, dict) and "rx_info" in ev.packet:
-                sources.append(ev.packet["rx_info"])
-            elif hasattr(ev.packet, "rx_info"):
-                sources.append(ev.packet.rx_info)
-        if hasattr(ev, "raw"):
-            sources.append(ev.raw)
-
-        # 1. Try to find SNR
-        for src in sources:
-            val = extract_value(src, snr_keys)
-            if val is not None:
-                snr = val
-                break
+        sender_ts = p.get("sender_timestamp")
+        
+        # 1. Pull from the background raw MESSAGE cache
+        cached = {}
+        if sender_ts is not None:
+            try:
+                cached = self._telemetry_cache.get(int(sender_ts), {})
+            except Exception:
+                pass
                 
-        # 2. Try to find RSSI
-        for src in sources:
-            val = extract_value(src, rssi_keys)
-            if val is not None:
-                rssi = val
-                break
+        # Fallback to the very last seen raw telemetry if no exact match
+        if not cached and self._last_telemetry:
+            cached = self._last_telemetry
 
-        # 3. Try to find Hops
-        for src in sources:
-            val = extract_value(src, hops_keys)
-            if val is not None:
-                hops = val
-                break
-
-        # Fallback hop calculation if path_len wasn't found
+        # Merge values
+        snr = cached.get("snr") if cached.get("snr") is not None else p.get("snr") or p.get("SNR")
+        rssi = cached.get("rssi") if cached.get("rssi") is not None else p.get("rssi") or p.get("RSSI")
+        
+        hops = p.get("path_len")
         if hops is None:
-            for src in sources:
-                hl = extract_value(src, ["hopLimit", "hop_limit"])
-                hs = extract_value(src, ["hopStart", "hop_start"])
-                if hl is not None:
-                    try:
-                        hl = int(hl)
-                        hs = int(hs) if hs is not None else hl
-                        hops = (hs - hl) if hs >= hl else 0
-                        break
-                    except (ValueError, TypeError):
-                        pass
+            hl = cached.get("hop_limit") if cached.get("hop_limit") is not None else p.get("hop_limit")
+            hs = cached.get("hop_start") if cached.get("hop_start") is not None else p.get("hop_start")
+            if hl is not None:
+                try:
+                    hl = int(hl)
+                    hs = int(hs) if hs is not None else hl
+                    hops = (hs - hl) if hs >= hl else 0
+                except Exception:
+                    pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
         safe_hops = hops if hops is not None else "?"
+
+        if self.debug:
+            print(f"[DBG] PING Formatting values: SNR={safe_snr}, RSSI={safe_rssi}, HOPS={safe_hops}")
 
         try:
             return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
@@ -648,13 +626,72 @@ class ChannelLLMBot:
 
     # ---------------- Event handlers ----------------
 
+    async def on_raw_message(self, ev) -> None:
+        """
+        Intercepts EventType.MESSAGE. 
+        This fires immediately before CHAN/DM events and contains the missing low-level radio metadata.
+        """
+        payload = getattr(ev, "payload", None)
+        if not payload:
+            return
+
+        # Safely convert to dict for universal extraction
+        d = {}
+        if isinstance(payload, dict):
+            d = payload
+        elif hasattr(payload, "__dict__"):
+            d = payload.__dict__
+        else:
+            try:
+                d = {k: getattr(payload, k) for k in dir(payload) if not k.startswith('_')}
+            except Exception:
+                pass
+
+        # Extract stats from top level
+        rssi = d.get("rssi") or d.get("rx_rssi") or d.get("rxRssi")
+        snr = d.get("snr") or d.get("rx_snr") or d.get("rxSnr")
+        hl = d.get("hop_limit") or d.get("hopLimit")
+        hs = d.get("hop_start") or d.get("hopStart")
+        
+        # Often tucked inside a packet or rx_info object
+        if hasattr(payload, "packet"):
+            pkt = payload.packet
+            if hasattr(pkt, "rx_info"):
+                rxi = pkt.rx_info
+                rssi = rssi or getattr(rxi, "rssi", None) or getattr(rxi, "rx_rssi", None)
+                snr = snr or getattr(rxi, "snr", None) or getattr(rxi, "rx_snr", None)
+                
+            # Sometimes inside packet dict
+            if isinstance(pkt, dict) and "rx_info" in pkt:
+                rxi = pkt["rx_info"]
+                rssi = rssi or rxi.get("rssi") or rxi.get("rx_rssi")
+                snr = snr or rxi.get("snr") or rxi.get("rx_snr")
+
+        # Get timestamp to map it
+        ts = d.get("timestamp") or d.get("rx_time") or d.get("sender_timestamp") or d.get("time")
+
+        telemetry = {"snr": snr, "rssi": rssi, "hop_limit": hl, "hop_start": hs}
+        self._last_telemetry = telemetry
+        
+        if ts is not None:
+            try:
+                self._telemetry_cache[int(ts)] = telemetry
+                # Prune cache
+                if len(self._telemetry_cache) > 20:
+                    oldest = min(self._telemetry_cache.keys())
+                    del self._telemetry_cache[oldest]
+            except Exception:
+                pass
+                
+        if self.debug and (rssi is not None or snr is not None):
+            print(f"[DBG] Intercepted Raw Telemetry (ts={ts}): {telemetry}")
+
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
-        # Ensure we can extract dictionary-like fields even if p is an object
         if hasattr(p, "to_dict"): p = p.to_dict()
         elif hasattr(p, "__dict__"): p = p.__dict__
         if not isinstance(p, dict): p = {}
-
+            
         ch_idx = p.get("channel_idx")
         is_ai_chan = ch_idx in self.ai_channels
         is_weather_chan = ch_idx in self.weather_channels
@@ -991,6 +1028,9 @@ async def main() -> None:
     mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
     mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
     mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
+
+    # Intercept raw messages for telemetry tracking BEFORE they become parsed text events
+    mesh.subscribe(EventType.MESSAGE, bot.on_raw_message)
 
     # Message listeners
     mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
