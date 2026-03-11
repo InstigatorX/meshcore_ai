@@ -2,7 +2,7 @@
 """
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + listens to channel messages AND direct messages
-+ periodically polls weather and broadcasts to the channel
++ Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts.
@@ -209,6 +209,9 @@ class ChannelLLMBot:
         dedupe_window_s: float,
         debug: bool,
         system_prompt: str,
+        weather_location: str,
+        weather_times: List[str],
+        weather_trigger: str,
     ):
         self.mesh = mesh
         self.llm = llm
@@ -219,6 +222,10 @@ class ChannelLLMBot:
         self.debug = debug
         self.dedupe_window_s = dedupe_window_s
         self.system_prompt = system_prompt
+
+        self.weather_location = weather_location
+        self.weather_times = weather_times
+        self.weather_trigger = weather_trigger.strip()
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
@@ -249,7 +256,6 @@ class ChannelLLMBot:
 
         async with self._contacts_lock:
             self._contacts_by_pubkey[pubkey] = contact
-            # only set prefix if unambiguous or first seen
             self._contacts_by_prefix.setdefault(prefix, pubkey)
 
         if self.debug:
@@ -261,7 +267,6 @@ class ChannelLLMBot:
         if not isinstance(p, dict):
             return
 
-        # payload shapes can vary; try common patterns
         candidates: List[Dict[str, Any]] = []
 
         if isinstance(p.get("contacts"), list):
@@ -269,7 +274,6 @@ class ChannelLLMBot:
                 if isinstance(c, dict):
                     candidates.append(c)
 
-        # sometimes CONTACTS may be a single contact dict
         if "public_key" in p and isinstance(p.get("public_key"), str):
             candidates.append(p)
 
@@ -277,10 +281,6 @@ class ChannelLLMBot:
             await self.upsert_contact(c)
 
     async def refresh_contacts_best_effort(self) -> None:
-        """
-        Tries to request contacts list. This is optional; cache can still populate via
-        NEW_CONTACT/NEXT_CONTACT/CONTACTS events depending on your node behavior.
-        """
         try:
             if hasattr(self.mesh.commands, "get_contacts"):
                 await getattr(self.mesh.commands, "get_contacts")()
@@ -288,16 +288,11 @@ class ChannelLLMBot:
             if hasattr(self.mesh.commands, "list_contacts"):
                 await getattr(self.mesh.commands, "list_contacts")()
                 return
-            if self.debug:
-                print("[DBG] No get_contacts/list_contacts method found; relying on contact events.")
         except Exception as e:
             if self.debug:
                 print(f"[DBG] refresh_contacts_best_effort error: {e}")
 
     def resolve_dm_dst(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Returns a destination dict containing a full 'public_key' that meshcore accepts.
-        """
         pk = payload.get("public_key")
         if isinstance(pk, str) and pk.strip():
             return {"public_key": pk.strip()}
@@ -307,7 +302,6 @@ class ChannelLLMBot:
             return None
         prefix = prefix.strip().lower()
 
-        pubkey: Optional[str] = None
         pubkey = self._contacts_by_prefix.get(prefix)
 
         if not pubkey:
@@ -321,52 +315,79 @@ class ChannelLLMBot:
 
         return {"public_key": pubkey}
 
-    # ---------------- Weather Poller ----------------
+    # ---------------- Weather Logic ----------------
 
-    async def poll_weather_loop(self, interval_m: float, location: str) -> None:
-        """Periodically polls the weather and broadcasts to the main channel."""
-        if interval_m <= 0 or not location:
-            return
-
-        interval_s = interval_m * 60.0
-        loc_encoded = urllib.parse.quote(location)
+    async def fetch_weather(self, location: str) -> str:
+        """Fetches a concise weather string from wttr.in."""
+        if not location:
+            return "No weather location specified."
         
+        loc_encoded = urllib.parse.quote(location)
         # wttr.in custom format: %l=Location, %c=Condition, %t=Temp, %w=Wind, %h=Humidity
         url = f"https://wttr.in/{loc_encoded}?format=%l:+%c+%t,+Wind+%w,+Hum+%h"
 
-        while True:
-            await asyncio.sleep(interval_s)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                weather_text = resp.text.strip()
+
+            if not weather_text or "Unknown location" in weather_text:
+                return f"Could not find weather for '{location}'."
+
+            # Fallback to prevent spamming if the API mistakenly returned an HTML page
+            if len(weather_text) > 150:
+                weather_text = weather_text[:147] + "..."
             
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
-                    weather_text = resp.text.strip()
+            return f"🌤️ {weather_text}"
 
-                if not weather_text or "Unknown location" in weather_text:
-                    if self.debug:
-                        print(f"[DBG] Weather fetch issue: {weather_text}")
-                    continue
+        except Exception as e:
+            if self.debug:
+                print(f"[DBG] Weather fetch error: {e}")
+            return f"Error fetching weather: {e}"
 
-                # Fallback to prevent spamming if the API mistakenly returned an HTML page
-                if len(weather_text) > 150:
-                    weather_text = weather_text[:147] + "..."
+    async def scheduled_weather_loop(self) -> None:
+        """Broadcasts weather at specifically configured times of day."""
+        if not self.weather_times or not self.weather_location:
+            return
+
+        # Parse times into tuples of (hour, minute)
+        parsed_times = []
+        for t_str in self.weather_times:
+            parts = t_str.split(":")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                parsed_times.append((int(parts[0]), int(parts[1])))
+
+        if not parsed_times:
+            if self.debug:
+                print("[DBG] No valid weather times found in schedule.")
+            return
+
+        last_sent_min = -1
+
+        while True:
+            now = time.localtime()
+            current_time = (now.tm_hour, now.tm_min)
+
+            if current_time in parsed_times and now.tm_min != last_sent_min:
+                last_sent_min = now.tm_min
                 
-                msg = f"🌤️ {weather_text}"
                 if self.debug:
-                    print(f"[DBG] Polled Weather: {msg}")
-
+                    print(f"[DBG] Triggering scheduled weather for {current_time}")
+                
+                # Fetch outside lock
+                ans = await self.fetch_weather(self.weather_location)
+                
+                # Send inside lock to serialize with LLM replies
                 async with self._llm_lock:
-                    parts = chunk_text(msg, self.max_reply_chars)
+                    parts = chunk_text(ans, self.max_reply_chars)
                     for i, part in enumerate(parts, start=1):
-                        out_msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-                        await self.mesh.commands.send_chan_msg(self.channel_idx, out_msg)
+                        msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                        await self.mesh.commands.send_chan_msg(self.channel_idx, msg)
                         await asyncio.sleep(1)
 
-            except Exception as e:
-                if self.debug:
-                    print(f"[DBG] Weather polling error: {e}")
-
+            # Check every 10 seconds to not miss the minute mark
+            await asyncio.sleep(10)
 
     # ---------------- Helpers ----------------
 
@@ -441,9 +462,26 @@ class ChannelLLMBot:
         if await self.dedupe_drop("chan", self.channel_idx, sender_ts, body):
             return
 
-        if self.debug:
-            print(f"[DBG] target-channel msg payload={p}")
+        # On-Demand Weather Check
+        body_lower = body.lower()
+        w_trigger = self.weather_trigger.lower()
+        if body_lower == w_trigger or body_lower.startswith(w_trigger + " "):
+            req_loc = body[len(self.weather_trigger):].strip()
+            target_loc = req_loc if req_loc else self.weather_location
+            
+            # Fetch outside lock so we don't block other tasks
+            ans = await self.fetch_weather(target_loc)
+            
+            async with self._llm_lock:
+                parts = chunk_text(ans, self.max_reply_chars)
+                for i, part in enumerate(parts, start=1):
+                    msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                    out = self.format_chan_reply(sender, msg)
+                    if out:
+                        await self.mesh.commands.send_chan_msg(self.channel_idx, out)
+            return
 
+        # LLM Trigger Check
         user = self.extract_after_trigger(body)
         if not user:
             return
@@ -489,13 +527,6 @@ class ChannelLLMBot:
         if await self.dedupe_drop("dm", -1, sender_ts, body):
             return
 
-        if self.debug:
-            print(f"[DBG] DM payload={p}")
-
-        user = self.extract_after_trigger(body)
-        if not user:
-            return
-
         dst = self.resolve_dm_dst(p)
         if dst is None:
             await self.refresh_contacts_best_effort()
@@ -504,6 +535,29 @@ class ChannelLLMBot:
         if dst is None:
             if self.debug:
                 print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
+            return
+
+        # On-Demand Weather Check
+        body_lower = body.lower()
+        w_trigger = self.weather_trigger.lower()
+        if body_lower == w_trigger or body_lower.startswith(w_trigger + " "):
+            req_loc = body[len(self.weather_trigger):].strip()
+            target_loc = req_loc if req_loc else self.weather_location
+            
+            ans = await self.fetch_weather(target_loc)
+            
+            async with self._llm_lock:
+                parts = chunk_text(ans, self.max_reply_chars)
+                for i, part in enumerate(parts, start=1):
+                    msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                    out = self.format_dm_reply(msg)
+                    if out:
+                        await self.mesh.commands.send_msg(dst, out)
+            return
+
+        # LLM Trigger Check
+        user = self.extract_after_trigger(body)
+        if not user:
             return
 
         async with self._llm_lock:
@@ -571,8 +625,10 @@ async def main() -> None:
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
     # Weather configurations
-    weather_interval_m = env_float("WEATHER_POLL_INTERVAL_M", 0.0)
     weather_location = env_str("WEATHER_LOCATION", "")
+    weather_times_raw = env_str("WEATHER_SCHEDULED_TIMES", "")
+    weather_times = [t.strip() for t in weather_times_raw.split(",") if t.strip()]
+    weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
@@ -622,6 +678,9 @@ async def main() -> None:
         dedupe_window_s=dedupe_window_s,
         debug=debug,
         system_prompt=system_prompt,
+        weather_location=weather_location,
+        weather_times=weather_times,
+        weather_trigger=weather_trigger,
     )
 
     # Contacts/cache feeders
@@ -636,13 +695,14 @@ async def main() -> None:
     # Try to warm contacts cache
     await bot.refresh_contacts_best_effort()
 
-    # Start weather poller background task if configured
-    if weather_interval_m > 0 and weather_location:
-        asyncio.create_task(bot.poll_weather_loop(weather_interval_m, weather_location))
-        print(f"[OK] Weather polling enabled: Location='{weather_location}', Interval={weather_interval_m}m")
+    # Start weather schedule background task if configured
+    if weather_times and weather_location:
+        asyncio.create_task(bot.scheduled_weather_loop())
+        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}")
 
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
     print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
+    print(f"[OK] On-demand weather enabled. Trigger='{weather_trigger}' (e.g. '{weather_trigger}' or '{weather_trigger} Paris')")
     print(f"[LLM] backend={backend}")
     if backend == "gemini":
         print(f"[LLM] model={env_str('GEMINI_MODEL', 'gemini-3-flash-preview')}")
@@ -656,9 +716,6 @@ async def main() -> None:
             f"[LLM] model={env_str('LOCAL_LLM_MODEL', 'local-model')} "
             f"url={env_str('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:1234/v1')}"
         )
-
-    print(f"[TEST] Channel: '{trigger} ping' or 'NAME: {trigger} ping' (expect: @NAME pong)")
-    print(f"[TEST] DM: '{trigger} ping' or 'NAME: {trigger} ping' (expect: pong)")
 
     await asyncio.sleep(float("inf"))
 
