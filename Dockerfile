@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mc_ai.py .
+COPY mc_ai_weather.py .
 
 # Run as non-root by default (safer).
 # If you need serial, ensure device permissions on host or run as root.
