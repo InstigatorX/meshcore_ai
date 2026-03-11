@@ -550,22 +550,46 @@ class ChannelLLMBot:
 
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
         """Extracts network telemetry from the packet payload."""
+        
+        # meshcore and python wrappers can be tricky. They often use camelCase, snake_case, 
+        # or hide the raw radio metrics inside nested dicts like "packet" or "rx_info".
+        search_dicts = [p]
+        for val in p.values():
+            if isinstance(val, dict):
+                search_dicts.append(val)
+
+        snr, rssi, hop_limit, hop_start = None, None, None, None
+
+        # Hunt down the telemetry values across all potential dict structures
+        for d in search_dicts:
+            if snr is None: snr = d.get("rxSnr") or d.get("rx_snr") or d.get("snr")
+            if rssi is None: rssi = d.get("rxRssi") or d.get("rx_rssi") or d.get("rssi")
+            if hop_limit is None: hop_limit = d.get("hopLimit") or d.get("hop_limit")
+            if hop_start is None: hop_start = d.get("hopStart") or d.get("hop_start")
+
         metrics = []
-        if "rx_snr" in p:
-            metrics.append(f"SNR: {p['rx_snr']}")
-        if "rx_rssi" in p:
-            metrics.append(f"RSSI: {p['rx_rssi']}dBm")
+        if snr is not None:
+            metrics.append(f"SNR: {snr}")
+        if rssi is not None:
+            metrics.append(f"RSSI: {rssi}dBm")
             
-        hop_limit = p.get("hop_limit")
-        hop_start = p.get("hop_start")
         if hop_limit is not None:
-            if hop_start is not None and hop_start >= hop_limit:
-                metrics.append(f"Hops: {hop_start - hop_limit}")
-            else:
+            try:
+                hl = int(hop_limit)
+                hs = int(hop_start) if hop_start is not None else hl
+                if hs >= hl:
+                    metrics.append(f"Hops: {hs - hl}")
+                else:
+                    metrics.append(f"HopLimit: {hl}")
+            except (ValueError, TypeError):
                 metrics.append(f"HopLimit: {hop_limit}")
 
         if not metrics:
+            if self.debug:
+                print(f"[DBG] No telemetry found! Payload keys: {list(p.keys())}")
+                print(f"[DBG] Full Payload: {p}")
             return "pong"
+            
         return "pong [" + ", ".join(metrics) + "]"
 
     # ---------------- Event handlers ----------------
