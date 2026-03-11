@@ -1,67 +1,18 @@
 #!/usr/bin/env python3
 """
-MeshCore weather + AI bot
+MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
++ separates AI channels and Weather channels.
++ Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
++ Includes today's forecast (High/Low/Rain chance)
++ Configurable polling for US National Weather Service (NWS) severe weather alerts.
++ Global `!ping` command with configurable template (returns SNR, RSSI, and Hops).
++ Global `!help` command listing available triggers based on context.
 
-Features
-- TCP or serial MeshCore transport
-- App-managed reconnect loop (MeshCore auto_reconnect disabled)
-- Separate AI channels and Weather channels
-- DM support for all commands
-- Global commands: !help, !ping
-- AI command: !ai ...
-- Weather command: !weather [location]
-- Scheduled weather broadcasts
-- NWS severe weather alert polling
-- Per-channel AI history
-- Contact cache for DM replies
-- Idle-based reconnect health monitor (uses last received packet time)
+DM replies require a destination with full 'public_key'. We resolve DM sender via
+pubkey_prefix by caching contacts. DMs support all commands.
 
-Environment
-  MESHCORE_TRANSPORT=tcp|serial             default: tcp
-  MESHCORE_HOST=...                         required for tcp
-  MESHCORE_PORT=5000
-  MESHCORE_SERIAL_PORT=/dev/ttyACM0         required for serial
-  MESHCORE_SERIAL_BAUD=115200
-  MESHCORE_AI_CHANNELS=#avl-ai
-  MESHCORE_WEATHER_CHANNELS=#weather-avl
-  CHANNEL_SCAN_MAX=16
-
-  AI_TRIGGER=!ai
-  PING_TRIGGER=!ping
-  HELP_TRIGGER=!help
-  WEATHER_TRIGGER=!weather
-  PING_TEMPLATE="pong [SNR: {snr}, RSSI: {rssi}dBm, Hops: {hops}]"
-
-  MAX_REPLY_CHARS=180
-  HISTORY_TURNS=6
-  DEDUPE_WINDOW_S=3.0
-  DEBUG=0
-
-  WEATHER_LOCATION=Asheville, NC
-  WEATHER_SCHEDULED_TIMES=07:30,18:00
-  WEATHER_UNITS=F
-  WEATHER_ALERTS_NWS_ZONES=NCZ053,NCC021
-  WEATHER_ALERTS_POLL_INTERVAL_M=15
-
-  HEALTH_IDLE_TIMEOUT_S=300
-  HEALTHCHECK_INTERVAL_S=10
-  RECONNECT_DELAY_S=5
-  RECONNECT_MAX_DELAY_S=60
-
-  LLM_BACKEND=gemini|ollama|openai_compat
-  SYSTEM_PROMPT=...
-
-  GEMINI_API_KEY=...
-  GEMINI_MODEL=gemini-3-flash-preview
-
-  OLLAMA_BASE_URL=http://127.0.0.1:11434
-  OLLAMA_MODEL=llama3.2:latest
-  OLLAMA_KEEP_ALIVE=5m
-
-  LOCAL_LLM_BASE_URL=http://127.0.0.1:1234/v1
-  LOCAL_LLM_MODEL=local-model
-  LOCAL_LLM_API_KEY=
-  LOCAL_LLM_TEMPERATURE=0.3
+Also fixes a race where duplicate inbound packets could invoke the LLM twice by
+locking the dedupe check.
 """
 
 import asyncio
@@ -70,53 +21,38 @@ import re
 import time
 import urllib.parse
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple, Set
 
 import httpx
-from meshcore import EventType, MeshCore
+from meshcore import MeshCore, EventType
 
+# Gemini optional
 try:
     from google import genai  # type: ignore
 except Exception:
     genai = None  # noqa: N816
 
 
-# ---------------------------
-# helpers
-# ---------------------------
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
-    "Keep replies short and directly useful (prefer 1–3 sentences). "
-    "If uncertain, say so briefly."
-)
-
-
-def env_str(name: str, default: str) -> str:
-    v = os.getenv(name, "").strip()
-    return v if v else default
-
-
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
-    return int(v) if v else default
+    return default if not v else int(v)
 
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name, "").strip()
-    return float(v) if v else default
+    return default if not v else float(v)
 
 
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "yes", "y", "on")
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name, "").strip()
+    return default if not v else v
 
 
 def normalize_channel_name(name: str) -> str:
     n = (name or "").strip()
-    return n[1:].strip().lower() if n.startswith("#") else n.lower()
+    if n.startswith("#"):
+        n = n[1:]
+    return n.strip().lower()
 
 
 def chunk_text(text: str, max_len: int) -> List[str]:
@@ -126,24 +62,31 @@ def chunk_text(text: str, max_len: int) -> List[str]:
     if len(text) <= max_len:
         return [text]
 
-    out: List[str] = []
+    chunks: List[str] = []
     cur = ""
-    for tok in re.split(r"(\s+)", text):
+    for tok in re.split(r"(\s+)", text):  # keep whitespace
         if len(cur) + len(tok) <= max_len:
             cur += tok
         else:
             if cur.strip():
-                out.append(cur.strip())
+                chunks.append(cur.strip())
             cur = tok
     if cur.strip():
-        out.append(cur.strip())
-    return out
+        chunks.append(cur.strip())
+    return chunks
 
 
-async def resolve_channels(mesh: MeshCore, names: List[str], max_channels: int) -> Dict[int, str]:
-    wanted = {normalize_channel_name(x) for x in names if x.strip()}
+async def resolve_channels(mesh: MeshCore, channel_names: List[str], max_channels: int = 16) -> Dict[int, str]:
+    """Finds the index of multiple channel names. Returns a dict of {idx: normalized_name}."""
+    if not channel_names:
+        return {}
+
+    want = {normalize_channel_name(c) for c in channel_names if c.strip()}
+    if not want:
+        return {}
+
     found: Dict[int, str] = {}
-
+    
     for idx in range(max_channels):
         ev = await mesh.commands.get_channel(idx)
         if ev.type == EventType.ERROR:
@@ -151,98 +94,60 @@ async def resolve_channels(mesh: MeshCore, names: List[str], max_channels: int) 
         payload = ev.payload or {}
         if not isinstance(payload, dict):
             continue
-        raw = payload.get("channel_name") or payload.get("name") or payload.get("chan_name") or ""
-        got = normalize_channel_name(str(raw))
-        if got in wanted:
+            
+        got_raw = payload.get("channel_name") or payload.get("name") or payload.get("chan_name") or ""
+        got = normalize_channel_name(str(got_raw))
+        
+        if got in want:
             found[idx] = got
 
-    if not found:
-        raise RuntimeError(f"None of the requested channels were found: {names}")
-
-    missing = wanted - set(found.values())
+    missing = want - set(found.values())
     if missing:
-        print(f"[WARN] Missing configured channels: {sorted(missing)}")
-
+        print(f"[WARN] Could not find requested channels: {missing} in first {max_channels} slots")
+        
+    if not found:
+        raise RuntimeError(f"None of the requested channels {channel_names} were found on this node!")
+        
     return found
 
 
-async def create_mesh_connection() -> MeshCore:
-    transport = env_str("MESHCORE_TRANSPORT", "tcp").lower()
-
-    if transport == "tcp":
-        host = env_str("MESHCORE_HOST", "")
-        if not host:
-            raise RuntimeError("Missing MESHCORE_HOST")
-        port = env_int("MESHCORE_PORT", 5000)
-        print(f"[INFO] MeshCore transport=tcp host={host} port={port}")
-        mesh = await MeshCore.create_tcp(host, port, auto_reconnect=False)
-        if mesh is None:
-            raise RuntimeError("MeshCore.create_tcp() returned None")
-        return mesh
-
-    if transport == "serial":
-        port = env_str("MESHCORE_SERIAL_PORT", "")
-        if not port:
-            raise RuntimeError("Missing MESHCORE_SERIAL_PORT")
-        baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
-        print(f"[INFO] MeshCore transport=serial port={port} baud={baud}")
-
-        for factory in ("create_serial", "create_uart", "create_usb", "create_serial_port"):
-            if hasattr(MeshCore, factory):
-                fn = getattr(MeshCore, factory)
-                try:
-                    mesh = await fn(port, baud, auto_reconnect=False)
-                except TypeError:
-                    mesh = await fn(port, auto_reconnect=False)
-                if mesh is None:
-                    raise RuntimeError(f"MeshCore.{factory}() returned None")
-                return mesh
-
-        raise RuntimeError("No supported MeshCore serial factory method found")
-
-    raise RuntimeError("MESHCORE_TRANSPORT must be tcp or serial")
-
-
-async def close_mesh(mesh: MeshCore) -> None:
-    if hasattr(mesh, "aclose"):
-        await mesh.aclose()
-    elif hasattr(mesh, "close"):
-        mesh.close()
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
+    "Keep replies short and directly useful (prefer 1–3 sentences). "
+    "If uncertain, say so briefly."
+)
 
 
 # ---------------------------
-# llm backends
+# LLM Clients
 # ---------------------------
 
 class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
 
-    async def aclose(self) -> None:
-        return None
-
 
 class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
         if genai is None:
-            raise RuntimeError("google-genai not installed")
-        self.client = genai.Client(api_key=api_key)
+            raise RuntimeError("google-genai not installed; pip install google-genai")
         self.model = model
+        self.client = genai.Client(api_key=api_key)
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        lines = [system_prompt, "", "Conversation:"]
+        prompt_lines = [system_prompt, "", "Conversation:"]
         for role, msg in conversation:
-            lines.append(f"{role}: {msg}")
-        lines.append("assistant:")
-        prompt = "\n".join(lines)
+            prompt_lines.append(f"{role}: {msg}")
+        prompt_lines.append("assistant:")
+        prompt = "\n".join(prompt_lines)
 
         def _call() -> str:
             resp = self.client.models.generate_content(model=self.model, contents=prompt)
             txt = getattr(resp, "text", None)
             return str(txt).strip() if txt else ""
 
-        out = await asyncio.to_thread(_call)
-        return out or "I couldn’t generate a response."
+        txt = await asyncio.to_thread(_call)
+        return txt or "I couldn’t generate a response."
 
 
 class OllamaClient(LLMClient):
@@ -250,148 +155,145 @@ class OllamaClient(LLMClient):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.keep_alive = keep_alive
-        self.http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         messages = [{"role": "system", "content": system_prompt}]
         for role, msg in conversation:
-            messages.append({"role": "assistant" if role == "assistant" else "user", "content": msg})
+            r = "assistant" if role == "assistant" else "user"
+            messages.append({"role": r, "content": msg})
 
-        r = await self.http.post(
-            f"{self.base_url}/api/chat",
-            json={"model": self.model, "messages": messages, "stream": False, "keep_alive": self.keep_alive},
-        )
+        payload = {"model": self.model, "messages": messages, "stream": False, "keep_alive": self.keep_alive}
+        url = f"{self.base_url}/api/chat"
+        r = await self._http.post(url, json=payload)
         r.raise_for_status()
         data = r.json()
-        return ((data.get("message") or {}).get("content") or "").strip() or "I couldn’t generate a response."
+        content = (data.get("message") or {}).get("content", "")
+        return (content or "").strip() or "I couldn’t generate a response."
 
     async def aclose(self) -> None:
-        await self.http.aclose()
+        await self._http.aclose()
 
 
 class OpenAICompatClient(LLMClient):
-    def __init__(self, base_url: str, model: str, api_key: Optional[str], temperature: float, timeout_s: float = 60.0):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        temperature: float = 0.3,
+        timeout_s: float = 60.0,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
-        self.http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
+        url = f"{self.base_url}/chat/completions"
         headers: Dict[str, str] = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         messages = [{"role": "system", "content": system_prompt}]
         for role, msg in conversation:
-            messages.append({"role": "assistant" if role == "assistant" else "user", "content": msg})
+            r = "assistant" if role == "assistant" else "user"
+            messages.append({"role": r, "content": msg})
 
-        r = await self.http.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json={"model": self.model, "messages": messages, "temperature": self.temperature},
-        )
+        payload = {"model": self.model, "messages": messages, "temperature": self.temperature}
+        r = await self._http.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         choices = data.get("choices") or []
         if not choices:
             return "I couldn’t generate a response."
-        return str(((choices[0].get("message") or {}).get("content")) or "").strip() or "I couldn’t generate a response."
+        content = ((choices[0].get("message") or {}).get("content")) or ""
+        return str(content).strip() or "I couldn’t generate a response."
 
     async def aclose(self) -> None:
-        await self.http.aclose()
-
-
-def build_llm() -> LLMClient:
-    backend = env_str("LLM_BACKEND", "gemini").lower()
-    if backend == "gemini":
-        api_key = env_str("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("Missing GEMINI_API_KEY")
-        return GeminiClient(api_key, env_str("GEMINI_MODEL", "gemini-3-flash-preview"))
-    if backend == "ollama":
-        return OllamaClient(
-            env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-            env_str("OLLAMA_MODEL", "llama3.2:latest"),
-            env_str("OLLAMA_KEEP_ALIVE", "5m"),
-        )
-    if backend == "openai_compat":
-        return OpenAICompatClient(
-            env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1"),
-            env_str("LOCAL_LLM_MODEL", "local-model"),
-            env_str("LOCAL_LLM_API_KEY", "") or None,
-            env_float("LOCAL_LLM_TEMPERATURE", 0.3),
-        )
-    raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+        await self._http.aclose()
 
 
 # ---------------------------
-# bot
+# Bot
 # ---------------------------
 
-class MeshBot:
+class ChannelLLMBot:
     def __init__(
         self,
         mesh: MeshCore,
         llm: LLMClient,
         ai_channels: Dict[int, str],
         weather_channels: Dict[int, str],
+        trigger: str,
+        ping_trigger: str,
+        help_trigger: str,
+        ping_template: str,
+        max_reply_chars: int,
+        history_turns: int,
+        dedupe_window_s: float,
+        debug: bool,
+        system_prompt: str,
+        weather_location: str,
+        weather_times: List[str],
+        weather_trigger: str,
+        weather_units: str,
     ):
         self.mesh = mesh
         self.llm = llm
-        self.ai_channels = ai_channels
-        self.weather_channels = weather_channels
+        self.ai_channels = ai_channels            # {idx: name}
+        self.weather_channels = weather_channels  # {idx: name}
+        self.trigger = trigger.strip()
+        self.ping_trigger = ping_trigger.strip()
+        self.help_trigger = help_trigger.strip()
+        self.ping_template = ping_template
+        self.max_reply_chars = max_reply_chars
+        self.debug = debug
+        self.dedupe_window_s = dedupe_window_s
+        self.system_prompt = system_prompt
 
-        self.trigger = env_str("AI_TRIGGER", "!ai").strip()
-        self.ping_trigger = env_str("PING_TRIGGER", "!ping").strip()
-        self.help_trigger = env_str("HELP_TRIGGER", "!help").strip()
-        self.weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
-        self.ping_template = env_str("PING_TEMPLATE", "pong [SNR: {snr}, RSSI: {rssi}dBm, Hops: {hops}]")
-
-        self.max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
-        self.debug = env_bool("DEBUG", False)
-        self.system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
-        self.weather_location = env_str("WEATHER_LOCATION", "")
-        self.weather_times = [t.strip() for t in env_str("WEATHER_SCHEDULED_TIMES", "").split(",") if t.strip()]
-        self.weather_units = env_str("WEATHER_UNITS", "F").upper()
+        self.weather_location = weather_location
+        self.weather_times = weather_times
+        self.weather_trigger = weather_trigger.strip()
+        self.weather_units = weather_units.upper()
+        self._seen_alerts: Set[str] = set()
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(self.trigger)}(\s+|$)", re.IGNORECASE)
 
-        history_turns = env_int("HISTORY_TURNS", 6)
+        # Separate AI history per AI channel index
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
             idx: deque(maxlen=history_turns * 2) for idx in ai_channels.keys()
         }
-        self.dm_history: Deque[Tuple[str, str]] = deque(maxlen=history_turns * 2)
 
+        # serialize LLM calls and mesh send bursts
         self._llm_lock = asyncio.Lock()
 
-        self.dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
+        # dedupe is separate and must be locked to avoid race duplicates
         self._dedupe_lock = asyncio.Lock()
-        self._seen: Dict[Tuple[str, int, int, str], float] = {}
+        self._seen_ts: Dict[Tuple[str, int, int, str], float] = {}  # (scope, ch, sender_ts, body) -> time
 
+        # Contacts cache for DM replies
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
-        self._contacts_by_prefix: Dict[str, str] = {}
+        self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
 
-        self._seen_alerts: Set[str] = set()
-        self.last_rx_time = time.time()
-
-    # ----- contacts -----
+    # ---------------- Contacts ----------------
 
     async def upsert_contact(self, contact: Dict[str, Any]) -> None:
         pk = contact.get("public_key")
         if not isinstance(pk, str) or not pk.strip():
             return
         pubkey = pk.strip().lower()
-        prefix = pubkey[:12]
+        prefix = pubkey[:12]  # matches your pubkey_prefix length (e.g., '2adad8233a4d')
 
         async with self._contacts_lock:
             self._contacts_by_pubkey[pubkey] = contact
-            self._contacts_by_prefix[prefix] = pubkey
+            self._contacts_by_prefix.setdefault(prefix, pubkey)
 
         if self.debug:
             name = contact.get("name") or contact.get("alias") or ""
-            print(f"[DBG] cached contact prefix={prefix} name={name}")
+            print(f"[DBG] cached contact pubkey_prefix={prefix} name={name}")
 
     async def on_contacts_event(self, ev) -> None:
         p = ev.payload or {}
@@ -399,8 +301,12 @@ class MeshBot:
             return
 
         candidates: List[Dict[str, Any]] = []
+
         if isinstance(p.get("contacts"), list):
-            candidates.extend([c for c in p["contacts"] if isinstance(c, dict)])
+            for c in p["contacts"]:
+                if isinstance(c, dict):
+                    candidates.append(c)
+
         if "public_key" in p and isinstance(p.get("public_key"), str):
             candidates.append(p)
 
@@ -414,6 +320,7 @@ class MeshBot:
                 return
             if hasattr(self.mesh.commands, "list_contacts"):
                 await getattr(self.mesh.commands, "list_contacts")()
+                return
         except Exception as e:
             if self.debug:
                 print(f"[DBG] refresh_contacts_best_effort error: {e}")
@@ -429,116 +336,27 @@ class MeshBot:
         prefix = prefix.strip().lower()
 
         pubkey = self._contacts_by_prefix.get(prefix)
+
         if not pubkey:
-            for pk2 in self._contacts_by_pubkey:
+            for pk2 in self._contacts_by_pubkey.keys():
                 if pk2.startswith(prefix):
                     pubkey = pk2
                     break
 
-        return {"public_key": pubkey} if pubkey else None
+        if not pubkey:
+            return None
 
-    # ----- formatting / helpers -----
+        return {"public_key": pubkey}
 
-    def build_conversation(self, channel_idx: Optional[int], user_text: str) -> List[Tuple[str, str]]:
-        if channel_idx is None:
-            return list(self.dm_history) + [("user", user_text)]
-        return list(self.history[channel_idx]) + [("user", user_text)]
-
-    def format_chan_reply(self, sender: str, msg: str) -> str:
-        msg = (msg or "").strip()
-        return f"@[{sender}] {msg}" if sender and msg else msg
-
-    def get_help_string(self, is_ai: bool, is_weather: bool) -> str:
-        cmds = [self.help_trigger, self.ping_trigger]
-        if is_weather:
-            cmds.append(f"{self.weather_trigger} [loc]")
-        if is_ai:
-            cmds.append(f"{self.trigger} [msg]")
-        return "Commands: " + ", ".join(cmds)
-
-    def get_telemetry_string(self, payload: Dict[str, Any]) -> str:
-        snr = payload.get("SNR") or payload.get("rxSnr") or payload.get("rx_snr") or payload.get("snr")
-        rssi = payload.get("RSSI") or payload.get("rxRssi") or payload.get("rx_rssi") or payload.get("rssi")
-        path_len = payload.get("path_len")
-
-        hops = None
-        if path_len is not None:
-            hops = path_len
-        else:
-            hop_limit = payload.get("hopLimit") or payload.get("hop_limit")
-            hop_start = payload.get("hopStart") or payload.get("hop_start")
-            if hop_limit is not None:
-                try:
-                    hl = int(hop_limit)
-                    hs = int(hop_start) if hop_start is not None else hl
-                    hops = (hs - hl) if hs >= hl else 0
-                except (TypeError, ValueError):
-                    pass
-
-        try:
-            return self.ping_template.format(
-                snr=snr if snr is not None else "?",
-                rssi=rssi if rssi is not None else "?",
-                hops=hops if hops is not None else "?",
-            )
-        except Exception:
-            return f"pong [SNR: {snr if snr is not None else '?'}, RSSI: {rssi if rssi is not None else '?'}dBm, Hops: {hops if hops is not None else '?'}]"
-
-    @staticmethod
-    def split_sender_and_body(text: str) -> Tuple[str, str]:
-        t = (text or "").strip()
-        if ": " in t:
-            name, body = t.split(": ", 1)
-            if name and len(name.strip()) <= 40:
-                return name.strip(), body.strip()
-        return "", t
-
-    def extract_after_trigger(self, body: str) -> str:
-        b = (body or "").strip()
-        if not self.trigger_re.search(b):
-            return ""
-        idx = b.lower().find(self.trigger.lower())
-        if idx < 0:
-            return ""
-        return b[idx + len(self.trigger):].strip(" \t:,-")
-
-    async def dedupe_drop(self, scope: str, ch_idx: int, sender_ts: int, body: str) -> bool:
-        key = (scope, ch_idx, sender_ts, body)
-        now = time.time()
-        async with self._dedupe_lock:
-            for k, t0 in list(self._seen.items()):
-                if now - t0 > self.dedupe_window_s:
-                    self._seen.pop(k, None)
-            if key in self._seen:
-                if self.debug:
-                    print(f"[DBG] duplicate dropped key={key}")
-                return True
-            self._seen[key] = now
-            return False
-
-    async def send_channel_text(self, ch_idx: int, sender: str, text: str) -> None:
-        parts = chunk_text(text, self.max_reply_chars)
-        for i, part in enumerate(parts, start=1):
-            msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-            out = self.format_chan_reply(sender, msg)
-            if out:
-                await self.mesh.commands.send_chan_msg(ch_idx, out)
-
-    async def send_dm_text(self, dst: Dict[str, Any], text: str) -> None:
-        parts = chunk_text(text, self.max_reply_chars)
-        for i, part in enumerate(parts, start=1):
-            msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
-            if msg:
-                await self.mesh.commands.send_msg(dst, msg)
-
-    # ----- weather -----
+    # ---------------- Weather & Alerts Logic ----------------
 
     async def fetch_weather(self, location: str) -> str:
+        """Fetches current weather and today's forecast from wttr.in using JSON format."""
         if not location:
             return "No weather location specified."
-
-        loc = urllib.parse.quote(location)
-        url = f"https://wttr.in/{loc}?format=j1"
+        
+        loc_encoded = urllib.parse.quote(location)
+        url = f"https://wttr.in/{loc_encoded}?format=j1"
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -549,6 +367,7 @@ class MeshBot:
             current = data.get("current_condition", [{}])[0]
             today = data.get("weather", [{}])[0]
 
+            # Current Conditions
             cond = current.get("weatherDesc", [{"value": "Unknown"}])[0].get("value", "Unknown")
             temp_f = current.get("temp_F", "?")
             temp_c = current.get("temp_C", "?")
@@ -556,94 +375,106 @@ class MeshBot:
             wind_kmh = current.get("windspeedKmph", "?")
             hum = current.get("humidity", "?")
 
+            # Today's Forecast
             high_f = today.get("maxtempF", "?")
             low_f = today.get("mintempF", "?")
             high_c = today.get("maxtempC", "?")
             low_c = today.get("mintempC", "?")
 
-            rain = max([int(h.get("chanceofrain", "0")) for h in today.get("hourly", [])] or [0])
-            snow = max([int(h.get("chanceofsnow", "0")) for h in today.get("hourly", [])] or [0])
+            # Precipitation Chances
+            rain_chances = [int(h.get("chanceofrain", "0")) for h in today.get("hourly", [])]
+            snow_chances = [int(h.get("chanceofsnow", "0")) for h in today.get("hourly", [])]
+            max_rain = max(rain_chances) if rain_chances else 0
+            max_snow = max(snow_chances) if snow_chances else 0
 
+            # Title case the location to make it look nicer
             display_loc = location.title()
-            if self.weather_units == "C":
-                msg = (
-                    f"🌤️ {display_loc}: {cond} {temp_c}°C "
-                    f"(Wind {wind_kmh}km/h, Hum {hum}%). "
-                    f"Today: High {high_c}°C / Low {low_c}°C"
-                )
-            else:
-                msg = (
-                    f"🌤️ {display_loc}: {cond} {temp_f}°F "
-                    f"(Wind {wind_mph}mph, Hum {hum}%). "
-                    f"Today: High {high_f}°F / Low {low_f}°F"
-                )
 
-            if snow > 0:
-                msg += f", Snow {snow}%"
-            elif rain > 0:
-                msg += f", Rain {rain}%"
+            if self.weather_units == "C":
+                msg = f"🌤️ {display_loc}: {cond} {temp_c}°C (Wind {wind_kmh}km/h, Hum {hum}%). " \
+                      f"Today: High {high_c}°C / Low {low_c}°C"
+            else:
+                msg = f"🌤️ {display_loc}: {cond} {temp_f}°F (Wind {wind_mph}mph, Hum {hum}%). " \
+                      f"Today: High {high_f}°F / Low {low_f}°F"
+
+            # Append significant precipitation chance
+            if max_snow > 0:
+                msg += f", Snow {max_snow}%"
+            elif max_rain > 0:
+                msg += f", Rain {max_rain}%"
 
             return msg
 
         except Exception as e:
             if self.debug:
                 print(f"[DBG] Weather fetch error for {location}: {e}")
-            return f"Could not find weather for '{location}' (API error)."
+            return f"Could not find weather for '{location}' (API Error)."
 
-    async def scheduled_weather_loop(self, stop_event: asyncio.Event) -> None:
+    async def scheduled_weather_loop(self) -> None:
+        """Broadcasts weather at specifically configured times of day to Weather channels."""
         if not self.weather_times or not self.weather_location or not self.weather_channels:
             return
 
-        parsed_times: List[Tuple[int, int]] = []
-        for t in self.weather_times:
-            hhmm = t.split(":")
-            if len(hhmm) == 2 and hhmm[0].isdigit() and hhmm[1].isdigit():
-                parsed_times.append((int(hhmm[0]), int(hhmm[1])))
+        parsed_times = []
+        for t_str in self.weather_times:
+            parts = t_str.split(":")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                parsed_times.append((int(parts[0]), int(parts[1])))
 
         if not parsed_times:
             return
 
         last_sent_min = -1
-        while not stop_event.is_set():
+
+        while True:
             now = time.localtime()
-            current = (now.tm_hour, now.tm_min)
-            if current in parsed_times and now.tm_min != last_sent_min:
+            current_time = (now.tm_hour, now.tm_min)
+
+            if current_time in parsed_times and now.tm_min != last_sent_min:
                 last_sent_min = now.tm_min
+                
                 if self.debug:
-                    print(f"[DBG] Triggering scheduled weather for {current}")
+                    print(f"[DBG] Triggering scheduled weather for {current_time}")
+                
                 ans = await self.fetch_weather(self.weather_location)
+                
+                # Send to ALL monitored Weather channels
                 async with self._llm_lock:
-                    for ch_idx in self.weather_channels:
-                        await self.send_channel_text(ch_idx, "", ans)
-                        await asyncio.sleep(2)
+                    parts = chunk_text(ans, self.max_reply_chars)
+                    for ch_idx in self.weather_channels.keys():
+                        for i, part in enumerate(parts, start=1):
+                            msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                            await self.mesh.commands.send_chan_msg(ch_idx, msg)
+                            await asyncio.sleep(2) # Prevent overwhelming network
 
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(10)
 
-    async def weather_alerts_loop(self, zones: str, interval_m: float, stop_event: asyncio.Event) -> None:
+    async def weather_alerts_loop(self, zones: str, interval_m: float) -> None:
+        """Polls the NWS API periodically and broadcasts to Weather channels."""
         if not zones or interval_m <= 0 or not self.weather_channels:
             return
 
-        url = f"https://api.weather.gov/alerts/active?zone={urllib.parse.quote(zones)}"
-        headers = {"User-Agent": "MeshCore-Weather-Alert-Bot/1.0 (https://github.com/)"}
         interval_s = interval_m * 60.0
+        headers = {"User-Agent": "MeshCore-Weather-Alert-Bot/1.0 (https://github.com/)"}
+        url = f"https://api.weather.gov/alerts/active?zone={urllib.parse.quote(zones)}"
 
-        while not stop_event.is_set():
+        while True:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.get(url, headers=headers)
                     resp.raise_for_status()
                     data = resp.json()
-
-                for feature in data.get("features", []):
+                
+                features = data.get("features", [])
+                for feature in features:
                     props = feature.get("properties", {})
                     alert_id = props.get("id")
+                    
                     if not alert_id or alert_id in self._seen_alerts:
                         continue
-
+                    
                     self._seen_alerts.add(alert_id)
+                    
                     if len(self._seen_alerts) > 500:
                         self._seen_alerts.clear()
                         self._seen_alerts.add(alert_id)
@@ -655,32 +486,127 @@ class MeshBot:
                     if self.debug:
                         print(f"[DBG] New Alert Found: {msg}")
 
+                    # Broadcast alert to all mapped Weather channels
                     async with self._llm_lock:
-                        for ch_idx in self.weather_channels:
-                            await self.send_channel_text(ch_idx, "", msg)
-                            await asyncio.sleep(2)
+                        parts = chunk_text(msg, self.max_reply_chars)
+                        for ch_idx in self.weather_channels.keys():
+                            for i, part in enumerate(parts, start=1):
+                                out_msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                                await self.mesh.commands.send_chan_msg(ch_idx, out_msg)
+                                await asyncio.sleep(2)
 
             except Exception as e:
                 if self.debug:
                     print(f"[DBG] Weather alert polling error: {e}")
 
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(interval_s)
 
-    # ----- event handlers -----
+    # ---------------- Helpers ----------------
+
+    @staticmethod
+    def split_sender_and_body(text: str) -> Tuple[str, str]:
+        t = (text or "").strip()
+        if ": " in t:
+            name, body = t.split(": ", 1)
+            name = name.strip()
+            body = body.strip()
+            if name and len(name) <= 40:
+                return name, body
+        return "", t
+
+    def extract_after_trigger(self, body: str) -> str:
+        b = (body or "").strip()
+        if not self.trigger_re.search(b):
+            return ""
+        idx = b.lower().find(self.trigger.lower())
+        if idx < 0:
+            return ""
+        return b[idx + len(self.trigger) :].strip(" \t:,-")
+
+    async def dedupe_drop(self, scope: str, ch_idx: int, sender_ts: int, body: str) -> bool:
+        key = (scope, ch_idx, sender_ts, body)
+        now = time.time()
+
+        async with self._dedupe_lock:
+            for k, t0 in list(self._seen_ts.items()):
+                if now - t0 > self.dedupe_window_s:
+                    self._seen_ts.pop(k, None)
+
+            if key in self._seen_ts:
+                if self.debug:
+                    print(f"[DBG] duplicate dropped key={key}")
+                return True
+
+            self._seen_ts[key] = now
+            return False
+
+    def build_conversation(self, ch_idx: int, user_text: str) -> List[Tuple[str, str]]:
+        hist = list(self.history[ch_idx])
+        return hist + [("user", user_text)]
+
+    def format_chan_reply(self, sender: str, msg: str) -> str:
+        msg = (msg or "").strip()
+        if not msg:
+            return ""
+        return f"@[{sender}] {msg}" if sender else msg
+
+    def format_dm_reply(self, msg: str) -> str:
+        return (msg or "").strip()
+
+    def get_help_string(self, is_ai: bool, is_weather: bool) -> str:
+        """Returns dynamically generated help text based on active features for the channel."""
+        cmds = [self.help_trigger, self.ping_trigger]
+        if is_weather:
+            cmds.append(f"{self.weather_trigger} [loc]")
+        if is_ai:
+            cmds.append(f"{self.trigger} [msg]")
+        return "Commands: " + ", ".join(cmds)
+
+    def get_telemetry_string(self, p: Dict[str, Any]) -> str:
+        """Extracts network telemetry from the payload and formats it using the template."""
+        
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
+        path_len = p.get("path_len")
+        
+        hops = None
+        if path_len is not None:
+            hops = path_len
+        else:
+            hop_limit = p.get("hopLimit") or p.get("hop_limit")
+            hop_start = p.get("hopStart") or p.get("hop_start")
+            if hop_limit is not None:
+                try:
+                    hl = int(hop_limit)
+                    hs = int(hop_start) if hop_start is not None else hl
+                    hops = (hs - hl) if hs >= hl else 0
+                except (ValueError, TypeError):
+                    pass
+
+        safe_snr = snr if snr is not None else "?"
+        safe_rssi = rssi if rssi is not None else "?"
+        safe_hops = hops if hops is not None else "?"
+
+        try:
+            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
+        except Exception as e:
+            if self.debug:
+                print(f"[DBG] PING_TEMPLATE formatting error: {e}")
+            # Safe fallback if user makes a typo in template variables
+            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
+
+    # ---------------- Event handlers ----------------
 
     async def on_channel_msg(self, ev) -> None:
-        self.last_rx_time = time.time()
-
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
-
+            
         ch_idx = p.get("channel_idx")
         is_ai_chan = ch_idx in self.ai_channels
         is_weather_chan = ch_idx in self.weather_channels
+
+        # Ignore if this channel isn't monitored for either
         if not is_ai_chan and not is_weather_chan:
             return
 
@@ -698,24 +624,43 @@ class MeshBot:
 
         body_lower = body.lower()
 
-        if body_lower == self.help_trigger.lower() or body_lower.startswith(self.help_trigger.lower() + " "):
-            await self.send_channel_text(ch_idx, sender, self.get_help_string(is_ai_chan, is_weather_chan))
+        # 0. Global Help Check
+        h_trigger = self.help_trigger.lower()
+        if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
+            reply_text = self.get_help_string(is_ai_chan, is_weather_chan)
+            out = self.format_chan_reply(sender, reply_text)
+            if out:
+                await self.mesh.commands.send_chan_msg(ch_idx, out)
             return
 
-        if body_lower == self.ping_trigger.lower() or body_lower.startswith(self.ping_trigger.lower() + " "):
-            await self.send_channel_text(ch_idx, sender, self.get_telemetry_string(p))
+        # 1. Global Ping Check
+        p_trigger = self.ping_trigger.lower()
+        if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
+            reply_text = self.get_telemetry_string(p)
+            out = self.format_chan_reply(sender, reply_text)
+            if out:
+                await self.mesh.commands.send_chan_msg(ch_idx, out)
             return
 
+        # 2. On-Demand Weather Check (Only in Weather Channels)
         if is_weather_chan:
-            w = self.weather_trigger.lower()
-            if body_lower == w or body_lower.startswith(w + " "):
+            w_trigger = self.weather_trigger.lower()
+            if body_lower == w_trigger or body_lower.startswith(w_trigger + " "):
                 req_loc = body[len(self.weather_trigger):].strip()
                 target_loc = req_loc if req_loc else self.weather_location
+                
                 ans = await self.fetch_weather(target_loc)
+                
                 async with self._llm_lock:
-                    await self.send_channel_text(ch_idx, sender, ans)
+                    parts = chunk_text(ans, self.max_reply_chars)
+                    for i, part in enumerate(parts, start=1):
+                        msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                        out = self.format_chan_reply(sender, msg)
+                        if out:
+                            await self.mesh.commands.send_chan_msg(ch_idx, out)
                 return
 
+        # 3. Check for LLM Trigger (Only in AI Channels)
         if is_ai_chan:
             user = self.extract_after_trigger(body)
             if not user:
@@ -724,16 +669,23 @@ class MeshBot:
             async with self._llm_lock:
                 self.history[ch_idx].append(("user", user))
                 conversation = self.build_conversation(ch_idx, user)
+
                 try:
                     answer = await self.llm.generate(self.system_prompt, conversation)
                 except Exception as e:
                     answer = f"LLM error: {e}"
+
                 self.history[ch_idx].append(("assistant", answer))
-                await self.send_channel_text(ch_idx, sender, answer)
+
+                parts = chunk_text(answer, self.max_reply_chars)
+                for i, part in enumerate(parts, start=1):
+                    msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                    out = self.format_chan_reply(sender, msg)
+                    if out:
+                        await self.mesh.commands.send_chan_msg(ch_idx, out)
+
 
     async def on_dm_msg(self, ev) -> None:
-        self.last_rx_time = time.time()
-
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
@@ -742,7 +694,7 @@ class MeshBot:
         if not isinstance(text, str):
             return
 
-        _sender, body = self.split_sender_and_body(text)
+        sender, body = self.split_sender_and_body(text)
         sender_ts = p.get("sender_timestamp")
         if not isinstance(sender_ts, int):
             sender_ts = -1
@@ -754,6 +706,7 @@ class MeshBot:
         if dst is None:
             await self.refresh_contacts_best_effort()
             dst = self.resolve_dm_dst(p)
+
         if dst is None:
             if self.debug:
                 print("[DBG] Could not resolve DM destination to full public_key; cannot reply.")
@@ -761,210 +714,228 @@ class MeshBot:
 
         body_lower = body.lower()
 
-        if body_lower == self.help_trigger.lower() or body_lower.startswith(self.help_trigger.lower() + " "):
-            await self.send_dm_text(dst, self.get_help_string(is_ai=True, is_weather=True))
+        # Global Help Check (DMs support everything)
+        h_trigger = self.help_trigger.lower()
+        if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
+            reply_text = self.get_help_string(is_ai=True, is_weather=True)
+            out = self.format_dm_reply(reply_text)
+            if out:
+                await self.mesh.commands.send_msg(dst, out)
             return
 
-        if body_lower == self.ping_trigger.lower() or body_lower.startswith(self.ping_trigger.lower() + " "):
-            await self.send_dm_text(dst, self.get_telemetry_string(p))
+        # Global Ping Check
+        p_trigger = self.ping_trigger.lower()
+        if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
+            reply_text = self.get_telemetry_string(p)
+            out = self.format_dm_reply(reply_text)
+            if out:
+                await self.mesh.commands.send_msg(dst, out)
             return
 
-        w = self.weather_trigger.lower()
-        if body_lower == w or body_lower.startswith(w + " "):
+        # On-Demand Weather Check
+        w_trigger = self.weather_trigger.lower()
+        if body_lower == w_trigger or body_lower.startswith(w_trigger + " "):
             req_loc = body[len(self.weather_trigger):].strip()
             target_loc = req_loc if req_loc else self.weather_location
+            
             ans = await self.fetch_weather(target_loc)
+            
             async with self._llm_lock:
-                await self.send_dm_text(dst, ans)
+                parts = chunk_text(ans, self.max_reply_chars)
+                for i, part in enumerate(parts, start=1):
+                    msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                    out = self.format_dm_reply(msg)
+                    if out:
+                        await self.mesh.commands.send_msg(dst, out)
             return
 
+        # LLM Trigger Check
         user = self.extract_after_trigger(body)
         if not user:
             return
 
         async with self._llm_lock:
-            self.dm_history.append(("user", user))
-            conversation = self.build_conversation(None, user)
+            dummy_idx = 999 
+            if dummy_idx not in self.history:
+                ml = self.history[list(self.ai_channels.keys())[0]].maxlen if self.ai_channels else 12
+                self.history[dummy_idx] = deque(maxlen=ml)
+            
+            self.history[dummy_idx].append(("user", user))
+            conversation = self.build_conversation(dummy_idx, user)
+            
             try:
                 answer = await self.llm.generate(self.system_prompt, conversation)
             except Exception as e:
                 answer = f"LLM error: {e}"
-            self.dm_history.append(("assistant", answer))
-            await self.send_dm_text(dst, answer)
+
+            self.history[dummy_idx].append(("assistant", answer))
+
+            parts = chunk_text(answer, self.max_reply_chars)
+            for i, part in enumerate(parts, start=1):
+                msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                out = self.format_dm_reply(msg)
+                if out:
+                    await self.mesh.commands.send_msg(dst, out)
 
 
-# ---------------------------
-# session / reconnect
-# ---------------------------
+async def create_mesh_connection() -> MeshCore:
+    transport = env_str("MESHCORE_TRANSPORT", "tcp").strip().lower()
 
-async def run_bot_once(llm: LLMClient) -> None:
-    ai_targets = [c.strip() for c in env_str("MESHCORE_AI_CHANNELS", "#avl-ai").split(",") if c.strip()]
-    weather_targets = [c.strip() for c in env_str("MESHCORE_WEATHER_CHANNELS", "#weather-avl").split(",") if c.strip()]
-    scan_max = env_int("CHANNEL_SCAN_MAX", 16)
+    if transport == "tcp":
+        host = env_str("MESHCORE_HOST", "")
+        if not host:
+            raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
+        port = env_int("MESHCORE_PORT", 5000)
+        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
 
-    print("[INFO] connecting to MeshCore...")
-    mesh = await create_mesh_connection()
-    await asyncio.sleep(1.0)
-    await mesh.start_auto_message_fetching()
+    if transport == "serial":
+        serial_port = env_str("MESHCORE_SERIAL_PORT", "")
+        if not serial_port:
+            raise SystemExit("Missing MESHCORE_SERIAL_PORT (required for MESHCORE_TRANSPORT=serial)")
+        baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
-    ai_channel_map = await resolve_channels(mesh, ai_targets, scan_max)
-    weather_channel_map = await resolve_channels(mesh, weather_targets, scan_max)
+        if hasattr(MeshCore, "create_serial"):
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
 
-    print("[OK] AI Channel map:")
-    for idx, name in ai_channel_map.items():
-        print(f"  idx={idx} -> {name}")
-    if not ai_channel_map:
-        print("  (None configured)")
+        for alt in ("create_uart", "create_usb", "create_serial_port"):
+            if hasattr(MeshCore, alt):
+                fn = getattr(MeshCore, alt)
+                return await fn(serial_port, baud, auto_reconnect=True)
 
-    print("[OK] Weather Channel map:")
-    for idx, name in weather_channel_map.items():
-        print(f"  idx={idx} -> {name}")
-    if not weather_channel_map:
-        print("  (None configured)")
+        raise SystemExit(
+            "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
+            "Run: python -c \"from meshcore import MeshCore; print([m for m in dir(MeshCore) if 'create' in m])\""
+        )
 
-    bot = MeshBot(mesh, llm, ai_channel_map, weather_channel_map)
-
-    mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
-    mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
-    mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
-    mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
-    mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
-
-    await bot.refresh_contacts_best_effort()
-
-    stop_event = asyncio.Event()
-    bg_tasks: List[asyncio.Task] = []
-
-    if bot.weather_times and bot.weather_location and weather_channel_map:
-        bg_tasks.append(asyncio.create_task(bot.scheduled_weather_loop(stop_event)))
-        print(f"[OK] Scheduled weather enabled: Location='{bot.weather_location}', Times={bot.weather_times}, Units={bot.weather_units}")
-
-    alerts_zones = env_str("WEATHER_ALERTS_NWS_ZONES", "")
-    alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
-    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
-        bg_tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m, stop_event)))
-        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
-
-    print("\n[OK] Connected and Listening.")
-    print(f"[TEST] Help      (Any channel or DM):  '{bot.help_trigger}'")
-    print(f"[TEST] Ping      (Any channel or DM):  '{bot.ping_trigger}'")
-    print(f"[TEST] AI Query  (AI Channels or DM):  '{bot.trigger} hello'")
-    print(f"[TEST] Weather   (Weather Ch. or DM):  '{bot.weather_trigger}' or '{bot.weather_trigger} Paris'\n")
-
-    loop = asyncio.get_running_loop()
-    disconnect_future: asyncio.Future[str] = loop.create_future()
-
-    async def on_disconnected(_ev) -> None:
-        print("[WARN] MeshCore disconnected event received")
-        if not disconnect_future.done():
-            disconnect_future.set_result("disconnected_event")
-
-    mesh.subscribe(EventType.DISCONNECTED, on_disconnected)
-
-    health_interval_s = env_int("HEALTHCHECK_INTERVAL_S", 10)
-    health_idle_timeout_s = env_int("HEALTH_IDLE_TIMEOUT_S", 300)
-
-    async def health_monitor() -> None:
-        while not disconnect_future.done():
-            idle = time.time() - bot.last_rx_time
-            if idle > health_idle_timeout_s:
-                print(f"[WARN] no packets received for {int(idle)}s -> forcing reconnect")
-                if not disconnect_future.done():
-                    disconnect_future.set_result("rx_timeout")
-                return
-
-            try:
-                await asyncio.wait_for(disconnect_future, timeout=health_interval_s)
-            except asyncio.TimeoutError:
-                pass
-
-    health_task = asyncio.create_task(health_monitor())
-
-reason: Optional[str] = None
-session_error: Optional[BaseException] = None
-
-try:
-    reason = await disconnect_future
-except asyncio.CancelledError as e:
-    session_error = e
-    print("[WARN] run_bot_once cancelled while waiting for disconnect_future")
-    raise
-except Exception as e:
-    session_error = e
-    print(f"[WARN] run_bot_once wait failed: {e}")
-    raise
-finally:
-    stop_event.set()
-
-    for task in bg_tasks:
-        task.cancel()
-    health_task.cancel()
-
-    for task in bg_tasks:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[WARN] background task ended with error: {e}")
-
-    try:
-        await health_task
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"[WARN] health task ended with error: {e}")
-
-    final_reason = reason or (
-        f"session_error:{type(session_error).__name__}" if session_error else "no_reason_recorded"
-    )
-
-    print(f"[INFO] Closing MeshCore connection... reason={final_reason}")
-    try:
-        await close_mesh(mesh)
-    except Exception as e:
-        if bot.debug:
-            print(f"[DBG] error while closing MeshCore connection: {e}")
+    raise SystemExit("MESHCORE_TRANSPORT must be one of: tcp | serial")
 
 
 async def main() -> None:
-    llm = build_llm()
+    # Separate Channels
+    ai_channels_raw = env_str("MESHCORE_AI_CHANNELS", "#avl-ai")
+    target_ai_channels = [c.strip() for c in ai_channels_raw.split(",") if c.strip()]
+    
+    weather_channels_raw = env_str("MESHCORE_WEATHER_CHANNELS", "#weather-avl")
+    target_weather_channels = [c.strip() for c in weather_channels_raw.split(",") if c.strip()]
+    
+    scan_max = env_int("CHANNEL_SCAN_MAX", 16)
 
-    reconnect_delay = env_int("RECONNECT_DELAY_S", 5)
-    reconnect_max_delay = env_int("RECONNECT_MAX_DELAY_S", 60)
-    delay = reconnect_delay
+    trigger = env_str("AI_TRIGGER", "!ai").strip()
+    ping_trigger = env_str("PING_TRIGGER", "!ping").strip()
+    help_trigger = env_str("HELP_TRIGGER", "!help").strip()
+    ping_template = env_str("PING_TEMPLATE", "pong [SNR: {snr}, RSSI: {rssi}dBm, Hops: {hops}]")
+    
+    max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
+    history_turns = env_int("HISTORY_TURNS", 6)
+    dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
+    debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
+    system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
-    try:
-        while True:
-            try:
-                await run_bot_once(llm)
-                print("[WARN] run_bot_once returned without raising; reconnecting")
-                delay = reconnect_delay
-            except asyncio.CancelledError:
-                print("[INFO] main task cancelled; shutting down cleanly")
-                break
-            except Exception as e:
-                print(f"[WARN] bot session ended unexpectedly: {e}")
+    # Weather configurations
+    weather_location = env_str("WEATHER_LOCATION", "")
+    weather_times_raw = env_str("WEATHER_SCHEDULED_TIMES", "")
+    weather_times = [t.strip() for t in weather_times_raw.split(",") if t.strip()]
+    weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
+    weather_units = env_str("WEATHER_UNITS", "F")  # "F" or "C"
+    
+    # Alert configurations
+    alerts_zones = env_str("WEATHER_ALERTS_NWS_ZONES", "")
+    alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
 
-            print(f"[INFO] reconnecting in {delay}s...")
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                print("[INFO] sleep cancelled; shutting down cleanly")
-                break
+    backend = env_str("LLM_BACKEND", "gemini").lower()
 
-            delay = min(delay * 2, reconnect_max_delay)
-    finally:
-        try:
-            await llm.aclose()
-        except Exception:
-            pass
+    llm: LLMClient
+    if backend == "gemini":
+        api_key = env_str("GEMINI_API_KEY", "")
+        if not api_key:
+            raise SystemExit("Missing GEMINI_API_KEY (required for LLM_BACKEND=gemini)")
+        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
+        llm = GeminiClient(api_key=api_key, model=model)
+    elif backend == "ollama":
+        base_url = env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        model = env_str("OLLAMA_MODEL", "llama3.2:latest")
+        keep_alive = env_str("OLLAMA_KEEP_ALIVE", "5m")
+        llm = OllamaClient(base_url=base_url, model=model, keep_alive=keep_alive)
+    elif backend == "openai_compat":
+        base_url = env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+        model = env_str("LOCAL_LLM_MODEL", "local-model")
+        api_key = env_str("LOCAL_LLM_API_KEY", "") or None
+        temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
+        llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
+    else:
+        raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+
+    mesh = await create_mesh_connection()
+    await mesh.start_auto_message_fetching()
+
+    # Resolve requested channels into dictionaries {index: name}
+    ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
+    weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
+
+    print("[OK] AI Channel map:")
+    if not ai_channel_map:
+        print("  (None configured)")
+    for idx, name in ai_channel_map.items():
+        print(f"  idx={idx} -> {name}")
+
+    print("[OK] Weather Channel map:")
+    if not weather_channel_map:
+        print("  (None configured)")
+    for idx, name in weather_channel_map.items():
+        print(f"  idx={idx} -> {name}")
+
+    bot = ChannelLLMBot(
+        mesh=mesh,
+        llm=llm,
+        ai_channels=ai_channel_map,
+        weather_channels=weather_channel_map,
+        trigger=trigger,
+        ping_trigger=ping_trigger,
+        help_trigger=help_trigger,
+        ping_template=ping_template,
+        max_reply_chars=max_reply_chars,
+        history_turns=history_turns,
+        dedupe_window_s=dedupe_window_s,
+        debug=debug,
+        system_prompt=system_prompt,
+        weather_location=weather_location,
+        weather_times=weather_times,
+        weather_trigger=weather_trigger,
+        weather_units=weather_units
+    )
+
+    # Contacts/cache feeders
+    mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
+    mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
+    mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
+
+    # Message listeners
+    mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
+    mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
+
+    # Try to warm contacts cache
+    await bot.refresh_contacts_best_effort()
+
+    # Start weather schedule background task if configured
+    if weather_times and weather_location and weather_channel_map:
+        asyncio.create_task(bot.scheduled_weather_loop())
+        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
+        
+    # Start NWS weather alerts polling task if configured
+    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
+        asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m))
+        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
+
+    print(f"\n[OK] Connected and Listening.")
+    print(f"[LLM] Backend={backend}")
+    print(f"--- COMMANDS ---")
+    print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
+    print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
+    print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
+    print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
+
+    await asyncio.sleep(float("inf"))
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user.")
-    except asyncio.CancelledError:
-        print("\n[INFO] Bot cancelled; exiting cleanly.")
+    asyncio.run(main())
