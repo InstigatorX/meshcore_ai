@@ -567,7 +567,7 @@ class ChannelLLMBot:
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
         """Extracts network telemetry from the payload and formats it using the template."""
         
-        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("SNR")
         rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
         path_len = p.get("path_len")
         
