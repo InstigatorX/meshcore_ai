@@ -128,6 +128,9 @@ class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
 
+    async def aclose(self) -> None:
+        pass
+
 
 class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
@@ -567,34 +570,63 @@ class ChannelLLMBot:
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
         """Extracts network telemetry from the payload and formats it using the template."""
         
-        snr = p.get("SNR")
-        rssi = p.get("RSSI")
-        path_len = p.get("path_len")
-        
-        hops = None
+        # Deep search the payload for nested telemetry dicts
+        search_dicts = [p]
+        for val in p.values():
+            if isinstance(val, dict):
+                search_dicts.append(val)
+
+        snr, rssi, path_len = None, None, None
+        hop_limit, hop_start = None, None
+
+        # Safely check using 'in' instead of .get() or .get() to prevent Python 'or' from skipping 0.0
+        for d in search_dicts:
+            if snr is None:
+                for k in ["SNR", "rxSnr", "rx_snr", "snr"]:
+                    if k in d and d[k] is not None:
+                        snr = d[k]
+                        break
+            if rssi is None:
+                for k in ["RSSI", "rxRssi", "rx_rssi", "rssi"]:
+                    if k in d and d[k] is not None:
+                        rssi = d[k]
+                        break
+            if path_len is None:
+                for k in ["path_len"]:
+                    if k in d and d[k] is not None:
+                        path_len = d[k]
+                        break
+            if hop_limit is None:
+                for k in ["hopLimit", "hop_limit"]:
+                    if k in d and d[k] is not None:
+                        hop_limit = d[k]
+                        break
+            if hop_start is None:
+                for k in ["hopStart", "hop_start"]:
+                    if k in d and d[k] is not None:
+                        hop_start = d[k]
+                        break
+
+        hops = "?"
         if path_len is not None:
             hops = path_len
-        else:
-            hop_limit = p.get("hopLimit") or p.get("hop_limit")
-            hop_start = p.get("hopStart") or p.get("hop_start")
-            if hop_limit is not None:
-                try:
-                    hl = int(hop_limit)
-                    hs = int(hop_start) if hop_start is not None else hl
-                    hops = (hs - hl) if hs >= hl else 0
-                except (ValueError, TypeError):
-                    pass
+        elif hop_limit is not None:
+            try:
+                hl = int(hop_limit)
+                hs = int(hop_start) if hop_start is not None else hl
+                hops = (hs - hl) if hs >= hl else 0
+            except (ValueError, TypeError):
+                pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
-        safe_hops = hops if hops is not None else "?"
 
         try:
-            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
+            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=hops)
         except Exception as e:
             if self.debug:
                 print(f"[DBG] PING_TEMPLATE formatting error: {e}")
-            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
+            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {hops}]"
 
     # ---------------- Event handlers ----------------
 
@@ -787,7 +819,8 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
+        # We explicitly use auto_reconnect=False here, as our supervisor loop handles this better
+        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -796,12 +829,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=True)
+                return await fn(serial_port, baud, auto_reconnect=False)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -868,6 +901,7 @@ async def main() -> None:
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
+    # Initialize LLM Client once
     llm: LLMClient
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
@@ -889,6 +923,10 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
+    # --------------------------------------------------------------------------
+    # Connect and Setup
+    # --------------------------------------------------------------------------
+    print("[INFO] Establishing connection to node...")
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
@@ -964,4 +1002,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user.")
