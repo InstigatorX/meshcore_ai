@@ -3,6 +3,7 @@
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + listens to multiple channels AND direct messages
 + Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
++ Includes today's forecast (High/Low/Rain chance)
 + Configurable polling for US National Weather Service (NWS) severe weather alerts.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
@@ -225,6 +226,7 @@ class ChannelLLMBot:
         weather_location: str,
         weather_times: List[str],
         weather_trigger: str,
+        weather_units: str,
     ):
         self.mesh = mesh
         self.llm = llm
@@ -238,6 +240,7 @@ class ChannelLLMBot:
         self.weather_location = weather_location
         self.weather_times = weather_times
         self.weather_trigger = weather_trigger.strip()
+        self.weather_units = weather_units.upper()
         self._seen_alerts: Set[str] = set()
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
@@ -332,32 +335,64 @@ class ChannelLLMBot:
     # ---------------- Weather & Alerts Logic ----------------
 
     async def fetch_weather(self, location: str) -> str:
-        """Fetches a concise weather string from wttr.in."""
+        """Fetches current weather and today's forecast from wttr.in using JSON format."""
         if not location:
             return "No weather location specified."
         
         loc_encoded = urllib.parse.quote(location)
-        url = f"https://wttr.in/{loc_encoded}?format=%l:+%c+%t,+Wind+%w,+Hum+%h"
+        url = f"https://wttr.in/{loc_encoded}?format=j1"
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
-                weather_text = resp.text.strip()
+                data = resp.json()
 
-            if not weather_text or "Unknown location" in weather_text:
-                return f"Could not find weather for '{location}'."
+            current = data.get("current_condition", [{}])[0]
+            today = data.get("weather", [{}])[0]
 
-            # Fallback to prevent spamming if the API mistakenly returned an HTML page
-            if len(weather_text) > 150:
-                weather_text = weather_text[:147] + "..."
-            
-            return f"🌤️ {weather_text}"
+            # Current Conditions
+            cond = current.get("weatherDesc", [{"value": "Unknown"}])[0].get("value", "Unknown")
+            temp_f = current.get("temp_F", "?")
+            temp_c = current.get("temp_C", "?")
+            wind_mph = current.get("windspeedMiles", "?")
+            wind_kmh = current.get("windspeedKmph", "?")
+            hum = current.get("humidity", "?")
+
+            # Today's Forecast
+            high_f = today.get("maxtempF", "?")
+            low_f = today.get("mintempF", "?")
+            high_c = today.get("maxtempC", "?")
+            low_c = today.get("mintempC", "?")
+
+            # Precipitation Chances (find the highest chance across all hours today)
+            rain_chances = [int(h.get("chanceofrain", "0")) for h in today.get("hourly", [])]
+            snow_chances = [int(h.get("chanceofsnow", "0")) for h in today.get("hourly", [])]
+            max_rain = max(rain_chances) if rain_chances else 0
+            max_snow = max(snow_chances) if snow_chances else 0
+
+            # Title case the location to make it look nicer (e.g. asheville -> Asheville)
+            display_loc = location.title()
+
+            if self.weather_units == "C":
+                msg = f"🌤️ {display_loc}: {cond} {temp_c}°C (Wind {wind_kmh}km/h, Hum {hum}%). " \
+                      f"Today: High {high_c}°C / Low {low_c}°C"
+            else:
+                msg = f"🌤️ {display_loc}: {cond} {temp_f}°F (Wind {wind_mph}mph, Hum {hum}%). " \
+                      f"Today: High {high_f}°F / Low {low_f}°F"
+
+            # Append significant precipitation chance
+            if max_snow > 0:
+                msg += f", Snow {max_snow}%"
+            elif max_rain > 0:
+                msg += f", Rain {max_rain}%"
+
+            return msg
 
         except Exception as e:
             if self.debug:
-                print(f"[DBG] Weather fetch error: {e}")
-            return f"Error fetching weather: {e}"
+                print(f"[DBG] Weather fetch error for {location}: {e}")
+            return f"Could not find weather for '{location}' (API Error)."
 
     async def scheduled_weather_loop(self) -> None:
         """Broadcasts weather at specifically configured times of day."""
@@ -629,9 +664,6 @@ class ChannelLLMBot:
                     await self.mesh.commands.send_msg(dst, out)
                 return
 
-            # Note: For DM history we could implement a separate dict keyed by pubkey,
-            # but for simplicity we treat DMs opaquely and pass 0 for history.
-            # You can adapt this if you want persistent history in DMs.
             dummy_idx = 999 
             if dummy_idx not in self.history:
                 self.history[dummy_idx] = deque(maxlen=self.history[list(self.channel_map.keys())[0]].maxlen)
@@ -703,8 +735,9 @@ async def main() -> None:
     weather_times_raw = env_str("WEATHER_SCHEDULED_TIMES", "")
     weather_times = [t.strip() for t in weather_times_raw.split(",") if t.strip()]
     weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
+    weather_units = env_str("WEATHER_UNITS", "F")  # "F" or "C"
     
-    # Alert configurations (Renamed to NWS_ZONES based on NWS API changes)
+    # Alert configurations
     alerts_zones = env_str("WEATHER_ALERTS_NWS_ZONES", "")
     alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
 
@@ -754,6 +787,7 @@ async def main() -> None:
         weather_location=weather_location,
         weather_times=weather_times,
         weather_trigger=weather_trigger,
+        weather_units=weather_units
     )
 
     # Contacts/cache feeders
@@ -771,7 +805,7 @@ async def main() -> None:
     # Start weather schedule background task if configured
     if weather_times and weather_location:
         asyncio.create_task(bot.scheduled_weather_loop())
-        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}")
+        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
         
     # Start NWS weather alerts polling task if configured
     if alerts_zones and alerts_interval_m > 0:
