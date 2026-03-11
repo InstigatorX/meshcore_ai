@@ -590,7 +590,7 @@ class ChannelLLMBot:
                 print(f"[DBG] Full Payload: {p}")
             return "pong"
             
-        return "pong [" + ", ".join(metrics) + "]"
+        return "🤖 ACK from Asheville\n[" + ", ".join(metrics) + "]"
 
     # ---------------- Event handlers ----------------
 
