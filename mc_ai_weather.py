@@ -128,9 +128,6 @@ class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
 
-    async def aclose(self) -> None:
-        pass
-
 
 class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
@@ -282,10 +279,6 @@ class ChannelLLMBot:
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
-        
-        # Telemetry Cache for intercepting raw radio metrics
-        self._telemetry_cache: Dict[int, Dict[str, Any]] = {}
-        self._last_telemetry: Dict[str, Any] = {}
 
     # ---------------- Contacts ----------------
 
@@ -571,51 +564,30 @@ class ChannelLLMBot:
             cmds.append(f"{self.trigger} [msg]")
         return "Commands: " + ", ".join(cmds)
 
-    def get_telemetry_string(self, ev: Any) -> str:
-        """Extracts network telemetry using the cached raw message data."""
+    def get_telemetry_string(self, p: Dict[str, Any]) -> str:
+        """Extracts network telemetry from the payload and formats it using the template."""
         
-        # Parse the decoded CHAN/DM payload
-        p = getattr(ev, "payload", {})
-        if hasattr(p, "to_dict"): p = p.to_dict()
-        elif hasattr(p, "__dict__"): p = p.__dict__
-        if not isinstance(p, dict): p = {}
-
-        sender_ts = p.get("sender_timestamp")
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
+        path_len = p.get("path_len")
         
-        # 1. Pull from the background raw MESSAGE cache
-        cached = {}
-        if sender_ts is not None:
-            try:
-                cached = self._telemetry_cache.get(int(sender_ts), {})
-            except Exception:
-                pass
-                
-        # Fallback to the very last seen raw telemetry if no exact match
-        if not cached and self._last_telemetry:
-            cached = self._last_telemetry
-
-        # Merge values
-        snr = cached.get("snr") if cached.get("snr") is not None else p.get("snr") or p.get("SNR")
-        rssi = cached.get("rssi") if cached.get("rssi") is not None else p.get("rssi") or p.get("RSSI")
-        
-        hops = p.get("path_len")
-        if hops is None:
-            hl = cached.get("hop_limit") if cached.get("hop_limit") is not None else p.get("hop_limit")
-            hs = cached.get("hop_start") if cached.get("hop_start") is not None else p.get("hop_start")
-            if hl is not None:
+        hops = None
+        if path_len is not None:
+            hops = path_len
+        else:
+            hop_limit = p.get("hopLimit") or p.get("hop_limit")
+            hop_start = p.get("hopStart") or p.get("hop_start")
+            if hop_limit is not None:
                 try:
-                    hl = int(hl)
-                    hs = int(hs) if hs is not None else hl
+                    hl = int(hop_limit)
+                    hs = int(hop_start) if hop_start is not None else hl
                     hops = (hs - hl) if hs >= hl else 0
-                except Exception:
+                except (ValueError, TypeError):
                     pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
         safe_hops = hops if hops is not None else "?"
-
-        if self.debug:
-            print(f"[DBG] PING Formatting values: SNR={safe_snr}, RSSI={safe_rssi}, HOPS={safe_hops}")
 
         try:
             return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
@@ -626,71 +598,10 @@ class ChannelLLMBot:
 
     # ---------------- Event handlers ----------------
 
-    async def on_raw_message(self, ev) -> None:
-        """
-        Intercepts EventType.MESSAGE. 
-        This fires immediately before CHAN/DM events and contains the missing low-level radio metadata.
-        """
-        payload = getattr(ev, "payload", None)
-        if not payload:
-            return
-
-        # Safely convert to dict for universal extraction
-        d = {}
-        if isinstance(payload, dict):
-            d = payload
-        elif hasattr(payload, "__dict__"):
-            d = payload.__dict__
-        else:
-            try:
-                d = {k: getattr(payload, k) for k in dir(payload) if not k.startswith('_')}
-            except Exception:
-                pass
-
-        # Extract stats from top level
-        rssi = d.get("rssi") or d.get("rx_rssi") or d.get("rxRssi")
-        snr = d.get("snr") or d.get("rx_snr") or d.get("rxSnr")
-        hl = d.get("hop_limit") or d.get("hopLimit")
-        hs = d.get("hop_start") or d.get("hopStart")
-        
-        # Often tucked inside a packet or rx_info object
-        if hasattr(payload, "packet"):
-            pkt = payload.packet
-            if hasattr(pkt, "rx_info"):
-                rxi = pkt.rx_info
-                rssi = rssi or getattr(rxi, "rssi", None) or getattr(rxi, "rx_rssi", None)
-                snr = snr or getattr(rxi, "snr", None) or getattr(rxi, "rx_snr", None)
-                
-            # Sometimes inside packet dict
-            if isinstance(pkt, dict) and "rx_info" in pkt:
-                rxi = pkt["rx_info"]
-                rssi = rssi or rxi.get("rssi") or rxi.get("rx_rssi")
-                snr = snr or rxi.get("snr") or rxi.get("rx_snr")
-
-        # Get timestamp to map it
-        ts = d.get("timestamp") or d.get("rx_time") or d.get("sender_timestamp") or d.get("time")
-
-        telemetry = {"snr": snr, "rssi": rssi, "hop_limit": hl, "hop_start": hs}
-        self._last_telemetry = telemetry
-        
-        if ts is not None:
-            try:
-                self._telemetry_cache[int(ts)] = telemetry
-                # Prune cache
-                if len(self._telemetry_cache) > 20:
-                    oldest = min(self._telemetry_cache.keys())
-                    del self._telemetry_cache[oldest]
-            except Exception:
-                pass
-                
-        if self.debug and (rssi is not None or snr is not None):
-            print(f"[DBG] Intercepted Raw Telemetry (ts={ts}): {telemetry}")
-
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
-        if hasattr(p, "to_dict"): p = p.to_dict()
-        elif hasattr(p, "__dict__"): p = p.__dict__
-        if not isinstance(p, dict): p = {}
+        if not isinstance(p, dict):
+            return
             
         ch_idx = p.get("channel_idx")
         is_ai_chan = ch_idx in self.ai_channels
@@ -726,7 +637,7 @@ class ChannelLLMBot:
         # 1. Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(ev)
+            reply_text = self.get_telemetry_string(p)
             out = self.format_chan_reply(sender, reply_text)
             if out:
                 await self.mesh.commands.send_chan_msg(ch_idx, out)
@@ -777,9 +688,8 @@ class ChannelLLMBot:
 
     async def on_dm_msg(self, ev) -> None:
         p = ev.payload or {}
-        if hasattr(p, "to_dict"): p = p.to_dict()
-        elif hasattr(p, "__dict__"): p = p.__dict__
-        if not isinstance(p, dict): p = {}
+        if not isinstance(p, dict):
+            return
 
         text = p.get("text")
         if not isinstance(text, str):
@@ -817,7 +727,7 @@ class ChannelLLMBot:
         # Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(ev)
+            reply_text = self.get_telemetry_string(p)
             out = self.format_dm_reply(reply_text)
             if out:
                 await self.mesh.commands.send_msg(dst, out)
@@ -877,8 +787,7 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        # We explicitly use auto_reconnect=False here, as our supervisor loop handles this better
-        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
+        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -887,12 +796,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=False)
+                return await fn(serial_port, baud, auto_reconnect=True)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -959,7 +868,6 @@ async def main() -> None:
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
-    # Initialize LLM Client once
     llm: LLMClient
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
@@ -981,10 +889,6 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
-    # --------------------------------------------------------------------------
-    # Connect and Setup
-    # --------------------------------------------------------------------------
-    print("[INFO] Establishing connection to node...")
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
@@ -1029,9 +933,6 @@ async def main() -> None:
     mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
     mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
 
-    # Intercept raw messages for telemetry tracking BEFORE they become parsed text events
-    mesh.subscribe(EventType.MESSAGE, bot.on_raw_message)
-
     # Message listeners
     mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
     mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
@@ -1063,7 +964,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user.")
+    asyncio.run(main())
