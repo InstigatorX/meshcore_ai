@@ -128,6 +128,9 @@ class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
 
+    async def aclose(self) -> None:
+        pass
+
 
 class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
@@ -564,26 +567,73 @@ class ChannelLLMBot:
             cmds.append(f"{self.trigger} [msg]")
         return "Commands: " + ", ".join(cmds)
 
-    def get_telemetry_string(self, p: Dict[str, Any]) -> str:
-        """Extracts network telemetry from the payload and formats it using the template."""
-        
-        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
-        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
-        path_len = p.get("path_len")
-        
-        hops = None
-        if path_len is not None:
-            hops = path_len
-        else:
-            hop_limit = p.get("hopLimit") or p.get("hop_limit")
-            hop_start = p.get("hopStart") or p.get("hop_start")
-            if hop_limit is not None:
-                try:
-                    hl = int(hop_limit)
-                    hs = int(hop_start) if hop_start is not None else hl
-                    hops = (hs - hl) if hs >= hl else 0
-                except (ValueError, TypeError):
-                    pass
+    def get_telemetry_string(self, ev: Any) -> str:
+        """Extracts network telemetry from anywhere in the event payload/object."""
+        snr, rssi, hops = None, None, None
+
+        # Helper to safely pull a value from either a dict or an object attribute
+        def extract_value(obj, keys_to_find):
+            if isinstance(obj, dict):
+                for k in keys_to_find:
+                    if k in obj and obj[k] is not None:
+                        return obj[k]
+            else:
+                for k in keys_to_find:
+                    if hasattr(obj, k) and getattr(obj, k) is not None:
+                        return getattr(obj, k)
+            return None
+
+        snr_keys = ["SNR", "snr", "rxSnr", "rx_snr"]
+        rssi_keys = ["RSSI", "rssi", "rxRssi", "rx_rssi"]
+        hops_keys = ["path_len", "hops"]
+
+        # Gather every possible place the telemetry data might be hiding
+        sources = [ev]
+        if hasattr(ev, "payload"):
+            sources.append(ev.payload)
+        if hasattr(ev, "packet"):
+            sources.append(ev.packet)
+            if isinstance(ev.packet, dict) and "rx_info" in ev.packet:
+                sources.append(ev.packet["rx_info"])
+            elif hasattr(ev.packet, "rx_info"):
+                sources.append(ev.packet.rx_info)
+        if hasattr(ev, "raw"):
+            sources.append(ev.raw)
+
+        # 1. Try to find SNR
+        for src in sources:
+            val = extract_value(src, snr_keys)
+            if val is not None:
+                snr = val
+                break
+                
+        # 2. Try to find RSSI
+        for src in sources:
+            val = extract_value(src, rssi_keys)
+            if val is not None:
+                rssi = val
+                break
+
+        # 3. Try to find Hops
+        for src in sources:
+            val = extract_value(src, hops_keys)
+            if val is not None:
+                hops = val
+                break
+
+        # Fallback hop calculation if path_len wasn't found
+        if hops is None:
+            for src in sources:
+                hl = extract_value(src, ["hopLimit", "hop_limit"])
+                hs = extract_value(src, ["hopStart", "hop_start"])
+                if hl is not None:
+                    try:
+                        hl = int(hl)
+                        hs = int(hs) if hs is not None else hl
+                        hops = (hs - hl) if hs >= hl else 0
+                        break
+                    except (ValueError, TypeError):
+                        pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
@@ -600,9 +650,11 @@ class ChannelLLMBot:
 
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
-        if not isinstance(p, dict):
-            return
-            
+        # Ensure we can extract dictionary-like fields even if p is an object
+        if hasattr(p, "to_dict"): p = p.to_dict()
+        elif hasattr(p, "__dict__"): p = p.__dict__
+        if not isinstance(p, dict): p = {}
+
         ch_idx = p.get("channel_idx")
         is_ai_chan = ch_idx in self.ai_channels
         is_weather_chan = ch_idx in self.weather_channels
@@ -637,7 +689,7 @@ class ChannelLLMBot:
         # 1. Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            reply_text = self.get_telemetry_string(ev)
             out = self.format_chan_reply(sender, reply_text)
             if out:
                 await self.mesh.commands.send_chan_msg(ch_idx, out)
@@ -688,8 +740,9 @@ class ChannelLLMBot:
 
     async def on_dm_msg(self, ev) -> None:
         p = ev.payload or {}
-        if not isinstance(p, dict):
-            return
+        if hasattr(p, "to_dict"): p = p.to_dict()
+        elif hasattr(p, "__dict__"): p = p.__dict__
+        if not isinstance(p, dict): p = {}
 
         text = p.get("text")
         if not isinstance(text, str):
@@ -727,7 +780,7 @@ class ChannelLLMBot:
         # Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            reply_text = self.get_telemetry_string(ev)
             out = self.format_dm_reply(reply_text)
             if out:
                 await self.mesh.commands.send_msg(dst, out)
@@ -787,7 +840,8 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
+        # We explicitly use auto_reconnect=False here, as our supervisor loop handles this better
+        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -796,12 +850,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=True)
+                return await fn(serial_port, baud, auto_reconnect=False)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -868,6 +922,7 @@ async def main() -> None:
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
+    # Initialize LLM Client once
     llm: LLMClient
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
@@ -889,6 +944,10 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
+    # --------------------------------------------------------------------------
+    # Connect and Setup
+    # --------------------------------------------------------------------------
+    print("[INFO] Establishing connection to node...")
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
@@ -964,4 +1023,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user.")
