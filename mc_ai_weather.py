@@ -399,7 +399,7 @@ class ChannelLLMBot:
         interval_s = interval_m * 60.0
         # The NWS API requires a User-Agent header
         headers = {"User-Agent": "MeshCore-Weather-Alert-Bot/1.0 (https://github.com/)"}
-        url = f"https://api.weather.gov/alerts/active?area={urllib.parse.quote(area)}"
+        url = f"https://api.weather.gov/alerts/active?zone={urllib.parse.quote(area)}"
 
         while True:
             try:
