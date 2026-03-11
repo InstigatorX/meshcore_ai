@@ -551,38 +551,33 @@ class ChannelLLMBot:
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
         """Extracts network telemetry from the packet payload."""
         
-        # meshcore and python wrappers can be tricky. They often use camelCase, snake_case, 
-        # or hide the raw radio metrics inside nested dicts like "packet" or "rx_info".
-        search_dicts = [p]
-        for val in p.values():
-            if isinstance(val, dict):
-                search_dicts.append(val)
-
-        snr, rssi, hop_limit, hop_start = None, None, None, None
-
-        # Hunt down the telemetry values across all potential dict structures
-        for d in search_dicts:
-            if snr is None: snr = d.get("rxSnr") or d.get("rx_snr") or d.get("SNR")
-            if rssi is None: rssi = d.get("rxRssi") or d.get("rx_rssi") or d.get("rssi")
-            if hop_limit is None: hop_limit = d.get("hopLimit") or d.get("path_len")
-            if hop_start is None: hop_start = d.get("hopStart") or d.get("hop_start")
-
+        # Check standard meshcore keys (some wrappers use uppercase 'SNR' and 'path_len' instead of hopLimit)
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
+        path_len = p.get("path_len")
+        
         metrics = []
         if snr is not None:
             metrics.append(f"SNR: {snr}")
         if rssi is not None:
             metrics.append(f"RSSI: {rssi}dBm")
             
-        if hop_limit is not None:
-            try:
-                hl = int(hop_limit)
-                hs = int(hop_start) if hop_start is not None else hl
-                if hs >= hl:
-                    metrics.append(f"Hops: {hs - hl}")
-                else:
-                    metrics.append(f"HopLimit: {hl}")
-            except (ValueError, TypeError):
-                metrics.append(f"HopLimit: {hop_limit}")
+        if path_len is not None:
+            metrics.append(f"Hops: {path_len}")
+        else:
+            # Fallback for other wrappers
+            hop_limit = p.get("hopLimit") or p.get("hop_limit")
+            hop_start = p.get("hopStart") or p.get("hop_start")
+            if hop_limit is not None:
+                try:
+                    hl = int(hop_limit)
+                    hs = int(hop_start) if hop_start is not None else hl
+                    if hs >= hl:
+                        metrics.append(f"Hops: {hs - hl}")
+                    else:
+                        metrics.append(f"HopLimit: {hl}")
+                except (ValueError, TypeError):
+                    metrics.append(f"HopLimit: {hop_limit}")
 
         if not metrics:
             if self.debug:
@@ -590,7 +585,7 @@ class ChannelLLMBot:
                 print(f"[DBG] Full Payload: {p}")
             return "pong"
             
-        return "🤖 ACK from Asheville\n[" + ", ".join(metrics) + "]"
+        return "pong [" + ", ".join(metrics) + "]"
 
     # ---------------- Event handlers ----------------
 
