@@ -567,79 +567,81 @@ class ChannelLLMBot:
             cmds.append(f"{self.trigger} [msg]")
         return "Commands: " + ", ".join(cmds)
 
-    def get_telemetry_string(self, p: Dict[str, Any]) -> str:
+    def get_telemetry_string(self, ev: Any) -> str:
+        p = getattr(ev, "payload", {}) or {}
+        
         print("\n" + "="*50)
         print("=== TELEMETRY DEBUG START ===")
-        print(f"RAW PAYLOAD DICT: {p}")
-        print("="*50)
+        print(f"EVENT ATTRIBUTES: {dir(ev)}")
+        print(f"PAYLOAD DICT: {p}")
+        
+        # Gather all possible dictionaries to search
+        search_dicts = [p]
+        if hasattr(ev, "packet") and isinstance(ev.packet, dict):
+            print(f"PACKET DICT: {ev.packet}")
+            search_dicts.append(ev.packet)
+            
+            # Meshtastic protobufs hide rx_snr inside rx_info
+            if "rx_info" in ev.packet:
+                search_dicts.append(ev.packet["rx_info"])
+                print(f"RX_INFO DICT: {ev.packet['rx_info']}")
+                
+        if hasattr(ev, "raw") and isinstance(ev.raw, dict):
+            search_dicts.append(ev.raw)
 
         # 1. Look for SNR
         snr = None
-        for k in ["SNR", "snr", "rxSnr", "rx_snr"]:
-            if k in p:
-                snr = p[k]
-                print(f"[DBG] Found SNR using key '{k}': {snr} (Type: {type(snr)})")
-                break
+        for d in search_dicts:
+            for k in ["SNR", "snr", "rxSnr", "rx_snr"]:
+                if k in d and d[k] is not None:
+                    snr = d[k]
+                    break
+            if snr is not None: break
                 
         # 2. Look for RSSI
         rssi = None
-        for k in ["RSSI", "rssi", "rxRssi", "rx_rssi"]:
-            if k in p:
-                rssi = p[k]
-                print(f"[DBG] Found RSSI using key '{k}': {rssi} (Type: {type(rssi)})")
-                break
+        for d in search_dicts:
+            for k in ["RSSI", "rssi", "rxRssi", "rx_rssi"]:
+                if k in d and d[k] is not None:
+                    rssi = d[k]
+                    break
+            if rssi is not None: break
 
         # 3. Look for Hops (path_len)
         hops = None
-        for k in ["path_len", "hops"]:
-            if k in p:
-                hops = p[k]
-                print(f"[DBG] Found Hops using key '{k}': {hops} (Type: {type(hops)})")
-                break
+        for d in search_dicts:
+            for k in ["path_len", "hops"]:
+                if k in d and d[k] is not None:
+                    hops = d[k]
+                    break
+            if hops is not None: break
 
-        # Check for alternative hop calculation
         if hops is None:
-            hl = p.get("hopLimit") or p.get("hop_limit")
-            hs = p.get("hopStart") or p.get("hop_start")
-            if hl is not None:
-                print(f"[DBG] Found HopLimit: {hl}, HopStart: {hs}")
-                try:
-                    hl = int(hl)
-                    hs = int(hs) if hs is not None else hl
-                    hops = (hs - hl) if hs >= hl else 0
-                    print(f"[DBG] Calculated Hops from Limit/Start: {hops}")
-                except Exception as e:
-                    print(f"[DBG] Hop calculation failed: {e}")
-
-        # Check nested dictionaries just in case
-        if snr is None or rssi is None or hops is None:
-            print("[DBG] Some values missing. Searching nested dictionaries...")
-            for key, val in p.items():
-                if isinstance(val, dict):
-                    print(f"[DBG] Checking nested dict under key '{key}': {val}")
-                    if snr is None:
-                        snr = val.get("SNR") or val.get("snr") or val.get("rxSnr") or val.get("rx_snr")
-                        if snr is not None: print(f"[DBG] Found nested SNR: {snr}")
-                    if rssi is None:
-                        rssi = val.get("RSSI") or val.get("rssi") or val.get("rxRssi") or val.get("rx_rssi")
-                        if rssi is not None: print(f"[DBG] Found nested RSSI: {rssi}")
+            for d in search_dicts:
+                hl = d.get("hopLimit") or d.get("hop_limit")
+                hs = d.get("hopStart") or d.get("hop_start")
+                if hl is not None:
+                    try:
+                        hl = int(hl)
+                        hs = int(hs) if hs is not None else hl
+                        hops = (hs - hl) if hs >= hl else 0
+                    except Exception:
+                        pass
+                if hops is not None: break
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
         safe_hops = hops if hops is not None else "?"
 
         print(f"[DBG] Final Variable Values -> SNR: {safe_snr} | RSSI: {safe_rssi} | HOPS: {safe_hops}")
-        print(f"[DBG] Current Template String: '{self.ping_template}'")
 
         try:
             res = self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
-            print(f"[DBG] Final Formatted Result: {res}")
             print("=== TELEMETRY DEBUG END ===\n")
             return res
         except Exception as e:
             print(f"[ERR] Template formatting crashed: {e}")
             print("=== TELEMETRY DEBUG END ===\n")
-            # Fallback if the user typed something wrong in PING_TEMPLATE env var
             return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
@@ -683,7 +685,7 @@ class ChannelLLMBot:
         # 1. Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            reply_text = self.get_telemetry_string(ev)  # <--- CHANGED THIS
             out = self.format_chan_reply(sender, reply_text)
             if out:
                 await self.mesh.commands.send_chan_msg(ch_idx, out)
@@ -773,7 +775,7 @@ class ChannelLLMBot:
         # Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            reply_text = self.get_telemetry_string(ev)  # <--- CHANGED THIS
             out = self.format_dm_reply(reply_text)
             if out:
                 await self.mesh.commands.send_msg(dst, out)
