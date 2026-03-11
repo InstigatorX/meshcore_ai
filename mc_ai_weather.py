@@ -880,42 +880,51 @@ async def run_bot_once(llm: LLMClient) -> None:
 
     health_task = asyncio.create_task(health_monitor())
 
-    reason = "unknown"
-    try:
-        reason = await disconnect_future
-    except asyncio.CancelledError:
-        if bot.debug:
-            print("[DBG] run_bot_once cancelled")
-    finally:
-        stop_event.set()
+reason: Optional[str] = None
+session_error: Optional[BaseException] = None
 
-        for task in bg_tasks:
-            task.cancel()
-        health_task.cancel()
+try:
+    reason = await disconnect_future
+except asyncio.CancelledError as e:
+    session_error = e
+    print("[WARN] run_bot_once cancelled while waiting for disconnect_future")
+    raise
+except Exception as e:
+    session_error = e
+    print(f"[WARN] run_bot_once wait failed: {e}")
+    raise
+finally:
+    stop_event.set()
 
-        for task in bg_tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                if bot.debug:
-                    print(f"[DBG] background task ended with error: {e}")
+    for task in bg_tasks:
+        task.cancel()
+    health_task.cancel()
 
+    for task in bg_tasks:
         try:
-            await health_task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            if bot.debug:
-                print(f"[DBG] health task ended with error: {e}")
+            print(f"[WARN] background task ended with error: {e}")
 
-        print(f"[INFO] Closing MeshCore connection... reason={reason}")
-        try:
-            await close_mesh(mesh)
-        except Exception as e:
-            if bot.debug:
-                print(f"[DBG] error while closing MeshCore connection: {e}")
+    try:
+        await health_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[WARN] health task ended with error: {e}")
+
+    final_reason = reason or (
+        f"session_error:{type(session_error).__name__}" if session_error else "no_reason_recorded"
+    )
+
+    print(f"[INFO] Closing MeshCore connection... reason={final_reason}")
+    try:
+        await close_mesh(mesh)
+    except Exception as e:
+        if bot.debug:
+            print(f"[DBG] error while closing MeshCore connection: {e}")
 
 
 async def main() -> None:
@@ -929,6 +938,7 @@ async def main() -> None:
         while True:
             try:
                 await run_bot_once(llm)
+                print("[WARN] run_bot_once returned without raising; reconnecting")
                 delay = reconnect_delay
             except asyncio.CancelledError:
                 print("[INFO] main task cancelled; shutting down cleanly")
