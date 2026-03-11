@@ -27,6 +27,8 @@ services:
       RECONNECT_DELAY_S: "5"       # Initial reconnect delay
       RECONNECT_MAX_DELAY_S: "60"  # Max exponential backoff delay
       # SYSTEM_PROMPT: "Optional override for default system prompt."
+      WEATHER_LOCATION: "AVL"
+      WEATHER_POLL_INTERVAL_M: "120"
 
       # --- LLM backend Selection ---
       LLM_BACKEND: "gemini"        # gemini | ollama | openai_compat
