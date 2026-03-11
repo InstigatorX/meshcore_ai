@@ -10,6 +10,10 @@ services:
       MESHCORE_PORT: "5000"
       # MESHCORE_SERIAL_PORT: /dev/ttyACM0 # Required if transport is serial
       # MESHCORE_SERIAL_BAUD: 115200
+      RECONNECT_DELAY_S: 5
+      RECONNECT_MAX_DELAY_S: 60
+      HEALTHCHECK_INTERVAL_S: 10
+      HEALTHCHECK_MAX_FAILURES: 3
 
       # --- Channels ---
       # Comma-separated lists of channels to monitor. 
