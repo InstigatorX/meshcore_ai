@@ -352,6 +352,7 @@ class MeshBot:
         self.debug = env_bool("DEBUG", False)
         self.system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
         self.weather_location = env_str("WEATHER_LOCATION", "")
+        self.weather_times = [t.strip() for t in env_str("WEATHER_SCHEDULED_TIMES", "").split(",") if t.strip()]
         self.weather_units = env_str("WEATHER_UNITS", "F").upper()
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(self.trigger)}(\s+|$)", re.IGNORECASE)
