@@ -983,6 +983,9 @@ async def run_bot_once(llm: LLMClient) -> None:
 
     try:
         await disconnect_future
+    except asyncio.CancelledError:
+        if debug:
+            print("[DBG] run_bot_once cancelled")
     finally:
         stop_event.set()
 
@@ -1016,7 +1019,6 @@ async def run_bot_once(llm: LLMClient) -> None:
         except Exception as e:
             if debug:
                 print(f"[DBG] error while closing MeshCore connection: {e}")
-
 
 async def main() -> None:
     backend = env_str("LLM_BACKEND", "gemini").lower()
@@ -1052,12 +1054,17 @@ async def main() -> None:
                 await run_bot_once(llm)
                 delay = reconnect_delay
             except asyncio.CancelledError:
-                raise
+                print("[INFO] main task cancelled; shutting down cleanly")
+                break
             except Exception as e:
                 print(f"[WARN] bot session ended unexpectedly: {e}")
 
             print(f"[INFO] reconnecting in {delay}s...")
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                print("[INFO] sleep cancelled; shutting down cleanly")
+                break
             delay = min(delay * 2, reconnect_max_delay)
     finally:
         try:
@@ -1065,9 +1072,10 @@ async def main() -> None:
         except Exception:
             pass
 
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[INFO] Bot stopped by user.")
+    except asyncio.CancelledError:
+        print("\n[INFO] Bot cancelled; exiting cleanly.")
