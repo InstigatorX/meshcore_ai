@@ -918,12 +918,12 @@ async def run_bot_once(llm: LLMClient) -> None:
     print(f"[TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
 
     loop = asyncio.get_running_loop()
-    disconnect_future: asyncio.Future[None] = loop.create_future()
+    disconnect_future: asyncio.Future[str] = loop.create_future()
 
     async def disconnected_handler(ev) -> None:
         print("[WARN] MeshCore disconnected event received")
         if not disconnect_future.done():
-            disconnect_future.set_result(None)
+            disconnect_future.set_result("disconnected_event")
 
     mesh.subscribe(EventType.DISCONNECTED, disconnected_handler)
 
@@ -959,7 +959,7 @@ async def run_bot_once(llm: LLMClient) -> None:
                         f"[WARN] health check failed {consecutive_failures} times in a row; forcing reconnect"
                     )
                     if not disconnect_future.done():
-                        disconnect_future.set_result(None)
+                        disconnect_future.set_result("health_check_failed")
                     return
 
             except Exception as e:
@@ -971,7 +971,7 @@ async def run_bot_once(llm: LLMClient) -> None:
                 if consecutive_failures >= healthcheck_max_failures:
                     print("[WARN] too many consecutive health check exceptions; forcing reconnect")
                     if not disconnect_future.done():
-                        disconnect_future.set_result(None)
+                        disconnect_future.set_result("health_check_exception")
                     return
 
             try:
@@ -981,8 +981,9 @@ async def run_bot_once(llm: LLMClient) -> None:
 
     health_task = asyncio.create_task(health_monitor())
 
+    reason = "unknown"
     try:
-        await disconnect_future
+        reason = await disconnect_future
     except asyncio.CancelledError:
         if debug:
             print("[DBG] run_bot_once cancelled")
@@ -1010,7 +1011,7 @@ async def run_bot_once(llm: LLMClient) -> None:
             if debug:
                 print(f"[DBG] health task ended with error: {e}")
 
-        print("[INFO] Closing MeshCore connection...")
+        print(f"[INFO] Closing MeshCore connection... reason={reason}")
         try:
             if hasattr(mesh, "aclose"):
                 await mesh.aclose()
