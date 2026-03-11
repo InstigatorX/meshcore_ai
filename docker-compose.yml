@@ -18,12 +18,13 @@ services:
 
       # --- Bot Settings ---
       AI_TRIGGER: "!ai"
+      PING_TRIGGER: "ping"
       MAX_REPLY_CHARS: "140"       # Max length per transmission chunk
       HISTORY_TURNS: "6"           # How many conversation turns to keep in memory
       DEDUPE_WINDOW_S: "3.0"       # Time window to ignore duplicate incoming messages
       DEBUG: "0"
       INCLUDE_REQUESTER_CONTEXT: "1" # 1=include SNR/hops in LLM prompt context, 0=hide
-      PING_REPLY_TEMPLATE: "🤖 ACK from Asheville\n[{stats}]" # Template for '!ai ping' replies
+      # PING_REPLY_TEMPLATE: "🤖 ACK from Asheville\n[{stats}]" # Template for '!ai ping' replies
       RECONNECT_DELAY_S: "5"       # Initial reconnect delay
       RECONNECT_MAX_DELAY_S: "60"  # Max exponential backoff delay
       # SYSTEM_PROMPT: "Optional override for default system prompt."
