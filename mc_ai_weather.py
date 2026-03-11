@@ -562,9 +562,9 @@ class ChannelLLMBot:
 
         # Hunt down the telemetry values across all potential dict structures
         for d in search_dicts:
-            if snr is None: snr = d.get("rxSnr") or d.get("rx_snr") or d.get("snr")
+            if snr is None: snr = d.get("rxSnr") or d.get("rx_snr") or d.get("SNR")
             if rssi is None: rssi = d.get("rxRssi") or d.get("rx_rssi") or d.get("rssi")
-            if hop_limit is None: hop_limit = d.get("hopLimit") or d.get("hop_limit")
+            if hop_limit is None: hop_limit = d.get("hopLimit") or d.get("path_len")
             if hop_start is None: hop_start = d.get("hopStart") or d.get("hop_start")
 
         metrics = []
