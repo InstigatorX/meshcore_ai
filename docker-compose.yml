@@ -6,29 +6,31 @@ services:
     environment:
       # --- MeshCore Transport (TCP shown) ---
       MESHCORE_TRANSPORT: "tcp"    # tcp | serial
-      MESHCORE_HOST: "192.168.83.197"
+      MESHCORE_HOST: "192.168.86.108"
       MESHCORE_PORT: "5000"
       # MESHCORE_SERIAL_PORT: /dev/ttyACM0 # Required if transport is serial
       # MESHCORE_SERIAL_BAUD: 115200
 
       # --- MeshCore Channels ---
       # Comma-separated list of channels to monitor. Replaces previously MESHCORE_CHANNEL_NAME.
-      MESHCORE_CHANNELS: "#avl-ai"
+      MESHCORE_CHANNELS: "#avl-ai,#weather-avl"
       CHANNEL_SCAN_MAX: "16"
 
       # --- Bot Settings ---
       AI_TRIGGER: "!ai"
-      MAX_REPLY_CHARS: "180"       # Max length per transmission chunk
+      MAX_REPLY_CHARS: "140"       # Max length per transmission chunk
       HISTORY_TURNS: "6"           # How many conversation turns to keep in memory
       DEDUPE_WINDOW_S: "3.0"       # Time window to ignore duplicate incoming messages
       DEBUG: "0"
       INCLUDE_REQUESTER_CONTEXT: "1" # 1=include SNR/hops in LLM prompt context, 0=hide
-      PING_REPLY_TEMPLATE: "🤖 Ack {who}\n[{stats}]" # Template for '!ai ping' replies
+      PING_REPLY_TEMPLATE: "🤖 ACK from Asheville\n[{stats}]" # Template for '!ai ping' replies
       RECONNECT_DELAY_S: "5"       # Initial reconnect delay
       RECONNECT_MAX_DELAY_S: "60"  # Max exponential backoff delay
       # SYSTEM_PROMPT: "Optional override for default system prompt."
       WEATHER_LOCATION: "AVL"
       WEATHER_POLL_INTERVAL_M: "120"
+      WEATHER_ALERTS_NWS_AREA: "NCZ053,NCC021" # The NWS area code to monitor (e.g., "NY" for New York State, "TX" for Texas, or a specific zone like "NYZ076").
+      WEATHER_ALERTS_POLL_INTERVAL_M: "15" # How often to check for alerts, in minutes (defaults to 15.0).
 
       # --- LLM backend Selection ---
       LLM_BACKEND: "gemini"        # gemini | ollama | openai_compat
