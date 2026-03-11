@@ -3,6 +3,7 @@
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + listens to channel messages AND direct messages
 + Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
++ Configurable polling for US National Weather Service (NWS) severe weather alerts.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts.
@@ -17,7 +18,7 @@ import re
 import time
 import urllib.parse
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple, Set
 
 import httpx
 from meshcore import MeshCore, EventType
@@ -226,6 +227,7 @@ class ChannelLLMBot:
         self.weather_location = weather_location
         self.weather_times = weather_times
         self.weather_trigger = weather_trigger.strip()
+        self._seen_alerts: Set[str] = set()
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(trigger)}(\s+|$)", re.IGNORECASE)
 
@@ -315,7 +317,7 @@ class ChannelLLMBot:
 
         return {"public_key": pubkey}
 
-    # ---------------- Weather Logic ----------------
+    # ---------------- Weather & Alerts Logic ----------------
 
     async def fetch_weather(self, location: str) -> str:
         """Fetches a concise weather string from wttr.in."""
@@ -388,6 +390,58 @@ class ChannelLLMBot:
 
             # Check every 10 seconds to not miss the minute mark
             await asyncio.sleep(10)
+
+    async def weather_alerts_loop(self, area: str, interval_m: float) -> None:
+        """Polls the NWS API periodically for new weather alerts."""
+        if not area or interval_m <= 0:
+            return
+
+        interval_s = interval_m * 60.0
+        # The NWS API requires a User-Agent header
+        headers = {"User-Agent": "MeshCore-Weather-Alert-Bot/1.0 (https://github.com/)"}
+        url = f"https://api.weather.gov/alerts/active?area={urllib.parse.quote(area)}"
+
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                
+                features = data.get("features", [])
+                for feature in features:
+                    props = feature.get("properties", {})
+                    alert_id = props.get("id")
+                    
+                    if not alert_id or alert_id in self._seen_alerts:
+                        continue
+                    
+                    self._seen_alerts.add(alert_id)
+                    
+                    # Prevent boundless growth of seen set
+                    if len(self._seen_alerts) > 500:
+                        self._seen_alerts.clear()
+                        self._seen_alerts.add(alert_id)
+
+                    headline = props.get("headline") or props.get("event") or "Unknown Severe Weather Alert"
+                    severity = props.get("severity", "Unknown")
+                    msg = f"🚨 ALERT ({severity}): {headline}"
+
+                    if self.debug:
+                        print(f"[DBG] New Alert Found: {msg}")
+
+                    async with self._llm_lock:
+                        parts = chunk_text(msg, self.max_reply_chars)
+                        for i, part in enumerate(parts, start=1):
+                            out_msg = part if len(parts) == 1 else f"({i}/{len(parts)}) {part}"
+                            await self.mesh.commands.send_chan_msg(self.channel_idx, out_msg)
+                            await asyncio.sleep(1)
+
+            except Exception as e:
+                if self.debug:
+                    print(f"[DBG] Weather alert polling error: {e}")
+
+            await asyncio.sleep(interval_s)
 
     # ---------------- Helpers ----------------
 
@@ -629,6 +683,10 @@ async def main() -> None:
     weather_times_raw = env_str("WEATHER_SCHEDULED_TIMES", "")
     weather_times = [t.strip() for t in weather_times_raw.split(",") if t.strip()]
     weather_trigger = env_str("WEATHER_TRIGGER", "!weather").strip()
+    
+    # Alert configurations
+    alerts_area = env_str("WEATHER_ALERTS_NWS_AREA", "")
+    alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
@@ -699,6 +757,11 @@ async def main() -> None:
     if weather_times and weather_location:
         asyncio.create_task(bot.scheduled_weather_loop())
         print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}")
+        
+    # Start NWS weather alerts polling task if configured
+    if alerts_area and alerts_interval_m > 0:
+        asyncio.create_task(bot.weather_alerts_loop(alerts_area, alerts_interval_m))
+        print(f"[OK] NWS weather alerts polling enabled: Area='{alerts_area}', Interval={alerts_interval_m}m")
 
     print(f"[OK] Connected | listening on {channel_name} (idx={chan_idx}) | trigger='{trigger}'")
     print(f"[OK] Listening for DMs via CONTACT_MSG_RECV (trigger='{trigger}')")
