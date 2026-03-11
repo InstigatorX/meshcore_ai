@@ -568,65 +568,79 @@ class ChannelLLMBot:
         return "Commands: " + ", ".join(cmds)
 
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
-        """Extracts network telemetry from the payload and formats it using the template."""
-        
-        # Deep search the payload for nested telemetry dicts
-        search_dicts = [p]
-        for val in p.values():
-            if isinstance(val, dict):
-                search_dicts.append(val)
+        print("\n" + "="*50)
+        print("=== TELEMETRY DEBUG START ===")
+        print(f"RAW PAYLOAD DICT: {p}")
+        print("="*50)
 
-        snr, rssi, path_len = None, None, None
-        hop_limit, hop_start = None, None
+        # 1. Look for SNR
+        snr = None
+        for k in ["SNR", "snr", "rxSnr", "rx_snr"]:
+            if k in p:
+                snr = p[k]
+                print(f"[DBG] Found SNR using key '{k}': {snr} (Type: {type(snr)})")
+                break
+                
+        # 2. Look for RSSI
+        rssi = None
+        for k in ["RSSI", "rssi", "rxRssi", "rx_rssi"]:
+            if k in p:
+                rssi = p[k]
+                print(f"[DBG] Found RSSI using key '{k}': {rssi} (Type: {type(rssi)})")
+                break
 
-        # Safely check using 'in' instead of .get() or .get() to prevent Python 'or' from skipping 0.0
-        for d in search_dicts:
-            if snr is None:
-                for k in ["SNR", "rxSnr", "rx_snr", "snr"]:
-                    if k in d and d[k] is not None:
-                        snr = d[k]
-                        break
-            if rssi is None:
-                for k in ["RSSI", "rxRssi", "rx_rssi", "rssi"]:
-                    if k in d and d[k] is not None:
-                        rssi = d[k]
-                        break
-            if path_len is None:
-                for k in ["path_len"]:
-                    if k in d and d[k] is not None:
-                        path_len = d[k]
-                        break
-            if hop_limit is None:
-                for k in ["hopLimit", "hop_limit"]:
-                    if k in d and d[k] is not None:
-                        hop_limit = d[k]
-                        break
-            if hop_start is None:
-                for k in ["hopStart", "hop_start"]:
-                    if k in d and d[k] is not None:
-                        hop_start = d[k]
-                        break
+        # 3. Look for Hops (path_len)
+        hops = None
+        for k in ["path_len", "hops"]:
+            if k in p:
+                hops = p[k]
+                print(f"[DBG] Found Hops using key '{k}': {hops} (Type: {type(hops)})")
+                break
 
-        hops = "?"
-        if path_len is not None:
-            hops = path_len
-        elif hop_limit is not None:
-            try:
-                hl = int(hop_limit)
-                hs = int(hop_start) if hop_start is not None else hl
-                hops = (hs - hl) if hs >= hl else 0
-            except (ValueError, TypeError):
-                pass
+        # Check for alternative hop calculation
+        if hops is None:
+            hl = p.get("hopLimit") or p.get("hop_limit")
+            hs = p.get("hopStart") or p.get("hop_start")
+            if hl is not None:
+                print(f"[DBG] Found HopLimit: {hl}, HopStart: {hs}")
+                try:
+                    hl = int(hl)
+                    hs = int(hs) if hs is not None else hl
+                    hops = (hs - hl) if hs >= hl else 0
+                    print(f"[DBG] Calculated Hops from Limit/Start: {hops}")
+                except Exception as e:
+                    print(f"[DBG] Hop calculation failed: {e}")
+
+        # Check nested dictionaries just in case
+        if snr is None or rssi is None or hops is None:
+            print("[DBG] Some values missing. Searching nested dictionaries...")
+            for key, val in p.items():
+                if isinstance(val, dict):
+                    print(f"[DBG] Checking nested dict under key '{key}': {val}")
+                    if snr is None:
+                        snr = val.get("SNR") or val.get("snr") or val.get("rxSnr") or val.get("rx_snr")
+                        if snr is not None: print(f"[DBG] Found nested SNR: {snr}")
+                    if rssi is None:
+                        rssi = val.get("RSSI") or val.get("rssi") or val.get("rxRssi") or val.get("rx_rssi")
+                        if rssi is not None: print(f"[DBG] Found nested RSSI: {rssi}")
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
+        safe_hops = hops if hops is not None else "?"
+
+        print(f"[DBG] Final Variable Values -> SNR: {safe_snr} | RSSI: {safe_rssi} | HOPS: {safe_hops}")
+        print(f"[DBG] Current Template String: '{self.ping_template}'")
 
         try:
-            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=hops)
+            res = self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
+            print(f"[DBG] Final Formatted Result: {res}")
+            print("=== TELEMETRY DEBUG END ===\n")
+            return res
         except Exception as e:
-            if self.debug:
-                print(f"[DBG] PING_TEMPLATE formatting error: {e}")
-            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {hops}]"
+            print(f"[ERR] Template formatting crashed: {e}")
+            print("=== TELEMETRY DEBUG END ===\n")
+            # Fallback if the user typed something wrong in PING_TEMPLATE env var
+            return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
 
