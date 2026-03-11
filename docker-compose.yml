@@ -28,8 +28,7 @@ services:
       RECONNECT_MAX_DELAY_S: "60"  # Max exponential backoff delay
       # SYSTEM_PROMPT: "Optional override for default system prompt."
       WEATHER_LOCATION: "AVL"
-      WEATHER_POLL_INTERVAL_M: "120"
-      WEATHER_ALERTS_NWS_AREA: "NCZ053,NCC021" # The NWS area code to monitor (e.g., "NY" for New York State, "TX" for Texas, or a specific zone like "NYZ076").
+      WEATHER_ALERTS_NWS_ZONES: "NCZ053,NCC021" # The NWS area code to monitor (e.g., "NY" for New York State, "TX" for Texas, or a specific zone like "NYZ076").
       WEATHER_ALERTS_POLL_INTERVAL_M: "15" # How often to check for alerts, in minutes (defaults to 15.0).
 
       # --- LLM backend Selection ---
