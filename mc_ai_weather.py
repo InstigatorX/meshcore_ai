@@ -128,9 +128,6 @@ class LLMClient:
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
         raise NotImplementedError
 
-    async def aclose(self) -> None:
-        pass
-
 
 class GeminiClient(LLMClient):
     def __init__(self, api_key: str, model: str):
@@ -567,81 +564,36 @@ class ChannelLLMBot:
             cmds.append(f"{self.trigger} [msg]")
         return "Commands: " + ", ".join(cmds)
 
-    def get_telemetry_string(self, ev: Any) -> str:
-        p = getattr(ev, "payload", {}) or {}
+    def get_telemetry_string(self, p: Dict[str, Any]) -> str:
+        """Extracts network telemetry from the payload and formats it using the template."""
         
-        print("\n" + "="*50)
-        print("=== TELEMETRY DEBUG START ===")
-        print(f"EVENT ATTRIBUTES: {dir(ev)}")
-        print(f"PAYLOAD DICT: {p}")
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
+        path_len = p.get("path_len")
         
-        # Gather all possible dictionaries to search
-        search_dicts = [p]
-        if hasattr(ev, "packet") and isinstance(ev.packet, dict):
-            print(f"PACKET DICT: {ev.packet}")
-            search_dicts.append(ev.packet)
-            
-            # Meshtastic protobufs hide rx_snr inside rx_info
-            if "rx_info" in ev.packet:
-                search_dicts.append(ev.packet["rx_info"])
-                print(f"RX_INFO DICT: {ev.packet['rx_info']}")
-                
-        if hasattr(ev, "raw") and isinstance(ev.raw, dict):
-            search_dicts.append(ev.raw)
-
-        # 1. Look for SNR
-        snr = None
-        for d in search_dicts:
-            for k in ["SNR", "snr", "rxSnr", "rx_snr"]:
-                if k in d and d[k] is not None:
-                    snr = d[k]
-                    break
-            if snr is not None: break
-                
-        # 2. Look for RSSI
-        rssi = None
-        for d in search_dicts:
-            for k in ["RSSI", "rssi", "rxRssi", "rx_rssi"]:
-                if k in d and d[k] is not None:
-                    rssi = d[k]
-                    break
-            if rssi is not None: break
-
-        # 3. Look for Hops (path_len)
         hops = None
-        for d in search_dicts:
-            for k in ["path_len", "hops"]:
-                if k in d and d[k] is not None:
-                    hops = d[k]
-                    break
-            if hops is not None: break
-
-        if hops is None:
-            for d in search_dicts:
-                hl = d.get("hopLimit") or d.get("hop_limit")
-                hs = d.get("hopStart") or d.get("hop_start")
-                if hl is not None:
-                    try:
-                        hl = int(hl)
-                        hs = int(hs) if hs is not None else hl
-                        hops = (hs - hl) if hs >= hl else 0
-                    except Exception:
-                        pass
-                if hops is not None: break
+        if path_len is not None:
+            hops = path_len
+        else:
+            hop_limit = p.get("hopLimit") or p.get("hop_limit")
+            hop_start = p.get("hopStart") or p.get("hop_start")
+            if hop_limit is not None:
+                try:
+                    hl = int(hop_limit)
+                    hs = int(hop_start) if hop_start is not None else hl
+                    hops = (hs - hl) if hs >= hl else 0
+                except (ValueError, TypeError):
+                    pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
         safe_hops = hops if hops is not None else "?"
 
-        print(f"[DBG] Final Variable Values -> SNR: {safe_snr} | RSSI: {safe_rssi} | HOPS: {safe_hops}")
-
         try:
-            res = self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
-            print("=== TELEMETRY DEBUG END ===\n")
-            return res
+            return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
         except Exception as e:
-            print(f"[ERR] Template formatting crashed: {e}")
-            print("=== TELEMETRY DEBUG END ===\n")
+            if self.debug:
+                print(f"[DBG] PING_TEMPLATE formatting error: {e}")
             return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
@@ -685,7 +637,7 @@ class ChannelLLMBot:
         # 1. Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(ev)  # <--- CHANGED THIS
+            reply_text = self.get_telemetry_string(p)
             out = self.format_chan_reply(sender, reply_text)
             if out:
                 await self.mesh.commands.send_chan_msg(ch_idx, out)
@@ -775,7 +727,7 @@ class ChannelLLMBot:
         # Global Ping Check
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(ev)  # <--- CHANGED THIS
+            reply_text = self.get_telemetry_string(p)
             out = self.format_dm_reply(reply_text)
             if out:
                 await self.mesh.commands.send_msg(dst, out)
@@ -835,8 +787,7 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        # We explicitly use auto_reconnect=False here, as our supervisor loop handles this better
-        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
+        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -845,12 +796,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=False)
+                return await fn(serial_port, baud, auto_reconnect=True)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -917,7 +868,6 @@ async def main() -> None:
 
     backend = env_str("LLM_BACKEND", "gemini").lower()
 
-    # Initialize LLM Client once
     llm: LLMClient
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
@@ -939,10 +889,6 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
-    # --------------------------------------------------------------------------
-    # Connect and Setup
-    # --------------------------------------------------------------------------
-    print("[INFO] Establishing connection to node...")
     mesh = await create_mesh_connection()
     await mesh.start_auto_message_fetching()
 
@@ -1018,7 +964,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user.")
+    asyncio.run(main())
