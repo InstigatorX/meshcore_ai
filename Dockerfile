@@ -20,4 +20,4 @@ COPY mc_ai_weather.py .
 RUN useradd -m -u 10001 appuser
 USER appuser
 
-ENTRYPOINT ["python", "/app/mc_ai.py"]
+ENTRYPOINT ["python", "/app/mc_ai_weather.py"]
