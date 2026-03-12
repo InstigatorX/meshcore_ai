@@ -280,6 +280,7 @@ class ChannelLLMBot:
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
         
+        # Telemetry Memory
         self._last_telemetry: Dict[str, Any] = {}
 
     # ---------------- Contacts ----------------
@@ -569,27 +570,27 @@ class ChannelLLMBot:
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
         """Extracts network telemetry from the payload and formats it using the template."""
         
-        # Try finding telemetry in the parsed dictionary first
-        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
-        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
+        # 1. Check Payload dictionary first
+        snr = p.get("SNR") or p.get("snr") or p.get("rxSnr") or p.get("rx_snr")
+        rssi = p.get("RSSI") or p.get("rssi") or p.get("rxRssi") or p.get("rx_rssi")
         
-        # Fallback to the background harvester cache
-        if snr is None: 
+        # 2. Check the memory cached from the background harvester if Payload didn't have it
+        if snr is None:
             snr = self._last_telemetry.get("snr")
-        if rssi is None: 
+        if rssi is None:
             rssi = self._last_telemetry.get("rssi")
-        
+
         path_len = p.get("path_len")
         hops = None
         if path_len is not None:
             hops = path_len
         else:
-            hop_limit = p.get("hopLimit") or p.get("hop_limit")
-            hop_start = p.get("hopStart") or p.get("hop_start")
-            if hop_limit is not None:
+            hl = p.get("hopLimit") or p.get("hop_limit")
+            hs = p.get("hopStart") or p.get("hop_start")
+            if hl is not None:
                 try:
-                    hl = int(hop_limit)
-                    hs = int(hop_start) if hop_start is not None else hl
+                    hl = int(hl)
+                    hs = int(hs) if hs is not None else hl
                     hops = (hs - hl) if hs >= hl else 0
                 except (ValueError, TypeError):
                     pass
@@ -608,6 +609,15 @@ class ChannelLLMBot:
     # ---------------- Event handlers ----------------
 
     async def on_channel_msg(self, ev) -> None:
+        if self.debug:
+            print(f"\n[DBG] === ON_CHANNEL_MSG EVENT ===")
+            print(f"[DBG] Event type: {type(ev)}")
+            print(f"[DBG] dir(ev): {dir(ev)}")
+            try: print(f"[DBG] vars(ev): {vars(ev)}")
+            except: pass
+            print(f"[DBG] payload: {getattr(ev, 'payload', 'N/A')}")
+            print("[DBG] ============================\n")
+
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
@@ -696,6 +706,15 @@ class ChannelLLMBot:
 
 
     async def on_dm_msg(self, ev) -> None:
+        if self.debug:
+            print(f"\n[DBG] === ON_DM_MSG EVENT ===")
+            print(f"[DBG] Event type: {type(ev)}")
+            print(f"[DBG] dir(ev): {dir(ev)}")
+            try: print(f"[DBG] vars(ev): {vars(ev)}")
+            except: pass
+            print(f"[DBG] payload: {getattr(ev, 'payload', 'N/A')}")
+            print("[DBG] =======================\n")
+
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
@@ -844,6 +863,9 @@ async def watchdog_loop(mesh: MeshCore, debug: bool) -> None:
 
 
 async def main() -> None:
+    debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
+    print(f"[INFO] Booting. Debug mode is: {'ENABLED' if debug else 'DISABLED'}")
+    
     # Separate Channels
     ai_channels_raw = env_str("MESHCORE_AI_CHANNELS", "#avl-ai")
     target_ai_channels = [c.strip() for c in ai_channels_raw.split(",") if c.strip()]
@@ -861,7 +883,6 @@ async def main() -> None:
     max_reply_chars = env_int("MAX_REPLY_CHARS", 180)
     history_turns = env_int("HISTORY_TURNS", 6)
     dedupe_window_s = env_float("DEDUPE_WINDOW_S", 3.0)
-    debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
     system_prompt = env_str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
     # Weather configurations
@@ -949,48 +970,51 @@ async def main() -> None:
     # Try to warm contacts cache
     await bot.refresh_contacts_best_effort()
 
-    bg_tasks = []
-
-    # Start background tasks
-    if weather_times and weather_location and weather_channel_map:
-        bg_tasks.append(asyncio.create_task(bot.scheduled_weather_loop()))
-        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
-        
-    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
-        bg_tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m)))
-        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
-
-    # --- START NEW TELEMETRY HARVESTER ---
-    # Listen on EventType.MESSAGE for raw RSSI/SNR as requested by user snippet
+    # --- START TELEMETRY HARVESTER TASK ---
     async def telemetry_harvester():
+        if debug: print("[DBG] Telemetry harvester task started.")
         try:
             if hasattr(mesh, "events"):
+                if debug: print("[DBG] mesh.events iterator found, listening for raw data...")
                 async for event in mesh.events:
-                    if getattr(event, "type", None) == getattr(EventType, "MESSAGE", None):
-                        payload = getattr(event, "payload", None)
-                        if payload:
-                            # Extract values exactly as requested
-                            rssi = getattr(payload, "rssi", None)
-                            snr = getattr(payload, "snr", None)
+                    # Look for anything resembling a raw message/packet object
+                    ev_type = getattr(event, "type", None)
+                    if debug: print(f"[DBG] Harvester caught raw event type: {ev_type}")
+                    
+                    payload = getattr(event, "payload", None)
+                    if payload:
+                        # Extract from object attributes
+                        rssi = getattr(payload, "rssi", None) or getattr(payload, "rx_rssi", None)
+                        snr = getattr(payload, "snr", None) or getattr(payload, "rx_snr", None)
+                        
+                        # Fallback to dict
+                        if isinstance(payload, dict):
+                            rssi = rssi if rssi is not None else (payload.get("rssi") or payload.get("rx_rssi"))
+                            snr = snr if snr is not None else (payload.get("snr") or payload.get("rx_snr"))
                             
-                            # Dictionary fallbacks just in case
-                            if rssi is None and isinstance(payload, dict):
-                                rssi = payload.get("rssi") or payload.get("rx_rssi")
-                            if snr is None and isinstance(payload, dict):
-                                snr = payload.get("snr") or payload.get("rx_snr")
-                                
-                            if rssi is not None or snr is not None:
-                                bot._last_telemetry = {"rssi": rssi, "snr": snr}
-                                if debug:
-                                    print(f"[DBG] Harvester caught telemetry: RSSI={rssi}, SNR={snr}")
+                        if rssi is not None or snr is not None:
+                            bot._last_telemetry = {"rssi": rssi, "snr": snr}
+                            if debug:
+                                print(f"[DBG] Harvester Saved Telemetry: RSSI={rssi}, SNR={snr}")
+            else:
+                if debug: print("[DBG] No mesh.events attribute found on this version of meshcore.")
         except Exception as e:
             if debug: print(f"[DBG] Telemetry harvester stopped: {e}")
 
-    bg_tasks.append(asyncio.create_task(telemetry_harvester()))
-    # --- END NEW TELEMETRY HARVESTER ---
+    # Fire off background tasks
+    asyncio.create_task(telemetry_harvester())
+    # --- END TELEMETRY HARVESTER TASK ---
+
+    if weather_times and weather_location and weather_channel_map:
+        asyncio.create_task(bot.scheduled_weather_loop())
+        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
+        
+    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
+        asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m))
+        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
     # Start Watchdog
-    bg_tasks.append(asyncio.create_task(watchdog_loop(mesh, debug)))
+    asyncio.create_task(watchdog_loop(mesh, debug))
 
     print(f"\n[OK] Connected and Listening.")
     print(f"[LLM] Backend={backend}")
@@ -1004,7 +1028,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
