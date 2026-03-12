@@ -12,9 +12,6 @@ MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts. DMs support all commands.
 
-Also fixes a race where duplicate inbound packets could invoke the LLM twice by
-locking the dedupe check.
-
 Safe fixes applied:
 - Prevent duplicate latest user turn from being sent to the LLM
 - Fix scheduled weather duplicate/minute logic across different hours
@@ -22,6 +19,15 @@ Safe fixes applied:
 - Make dedupe key safer when sender_timestamp is missing
 - Validate weather units
 - Add clean shutdown for HTTP clients / mesh if process exits normally
+
+Telemetry fix applied:
+- Remove unsupported/undocumented mesh.events harvester
+- Use EventType.RX_LOG_DATA as telemetry source
+- Keep a small rolling RX log buffer
+- Match !ping replies against recent RX_LOG_DATA entries by:
+  - expected message type (GRP_TXT for channels, TEXT_MSG for DMs)
+  - matching path_len
+  - closest recv_time to sender_timestamp
 """
 
 import asyncio
@@ -121,7 +127,6 @@ async def resolve_channels(mesh: MeshCore, channel_names: List[str], max_channel
     if missing:
         print(f"[WARN] Could not find requested channels: {missing} in first {max_channels} slots")
 
-    # Safe fix: allow channel group to be optional instead of hard failing startup
     return found
 
 
@@ -285,29 +290,24 @@ class ChannelLLMBot:
 
         self.trigger_re = re.compile(rf"(^|\s+){re.escape(self.trigger)}(\s+|$)", re.IGNORECASE)
 
-        # Separate AI history per AI channel index
         self.history: Dict[int, Deque[Tuple[str, str]]] = {
             idx: deque(maxlen=history_turns * 2) for idx in ai_channels.keys()
         }
 
-        # Serialize LLM calls
         self._llm_lock = asyncio.Lock()
-
-        # Serialize sends separately
         self._send_lock = asyncio.Lock()
 
-        # Dedupe lock
         self._dedupe_lock = asyncio.Lock()
         self._seen_ts: Dict[Tuple[str, int, str, int, str], float] = {}
         # key = (scope, ch, sender_id, sender_ts, body) -> time
 
-        # Contacts cache for DM replies
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}
 
-        # Telemetry memory
-        self._last_telemetry: Dict[str, Any] = {}
+        # RX log rolling buffer for matching telemetry to decoded messages
+        self._rxlog_lock = asyncio.Lock()
+        self._recent_rxlog: Deque[Dict[str, Any]] = deque(maxlen=100)
 
     # ---------------- Contacts ----------------
 
@@ -379,6 +379,81 @@ class ChannelLLMBot:
 
         return {"public_key": pubkey}
 
+    # ---------------- RX log telemetry matching ----------------
+
+    async def on_rx_log_data(self, ev) -> None:
+        p = ev.payload or {}
+        if not isinstance(p, dict):
+            return
+
+        entry = {
+            "recv_time": p.get("recv_time"),
+            "snr": p.get("snr"),
+            "rssi": p.get("rssi"),
+            "path_len": p.get("path_len"),
+            "payload_typename": p.get("payload_typename"),
+            "pkt_hash": p.get("pkt_hash"),
+        }
+
+        async with self._rxlog_lock:
+            self._recent_rxlog.append(entry)
+
+        if self.debug:
+            print(
+                "[DBG] RX_LOG cached "
+                f"type={entry['payload_typename']} "
+                f"path_len={entry['path_len']} "
+                f"snr={entry['snr']} rssi={entry['rssi']} "
+                f"recv_time={entry['recv_time']}"
+            )
+
+    async def match_telemetry_for_message(self, is_dm: bool, msg_payload: Dict[str, Any]) -> Dict[str, Any]:
+        expected_type = "TEXT_MSG" if is_dm else "GRP_TXT"
+        msg_path_len = msg_payload.get("path_len")
+        sender_ts = msg_payload.get("sender_timestamp")
+
+        async with self._rxlog_lock:
+            candidates = list(self._recent_rxlog)
+
+        best: Optional[Dict[str, Any]] = None
+        best_score: Optional[int] = None
+
+        for c in candidates:
+            if c.get("payload_typename") != expected_type:
+                continue
+
+            score = 0
+
+            if msg_path_len is not None and c.get("path_len") == msg_path_len:
+                score += 100
+
+            recv_time = c.get("recv_time")
+            if isinstance(sender_ts, int) and isinstance(recv_time, int):
+                dt = abs(recv_time - sender_ts)
+                if dt > 30:
+                    continue
+                score += max(0, 30 - dt)
+
+            if best is None or best_score is None or score > best_score:
+                best = c
+                best_score = score
+
+        if self.debug:
+            if best:
+                print(
+                    "[DBG] matched telemetry "
+                    f"expected_type={expected_type} msg_path_len={msg_path_len} "
+                    f"snr={best.get('snr')} rssi={best.get('rssi')} "
+                    f"rx_path_len={best.get('path_len')} recv_time={best.get('recv_time')}"
+                )
+            else:
+                print(
+                    "[DBG] no telemetry match "
+                    f"expected_type={expected_type} msg_path_len={msg_path_len} sender_ts={sender_ts}"
+                )
+
+        return best or {}
+
     # ---------------- Weather & Alerts Logic ----------------
 
     async def fetch_weather(self, location: str) -> str:
@@ -415,7 +490,11 @@ class ChannelLLMBot:
             max_rain = max(rain_chances) if rain_chances else 0
             max_snow = max(snow_chances) if snow_chances else 0
 
-            display_loc = location.title()
+            display_loc = location.strip()
+            if display_loc.isupper():
+                pass
+            else:
+                display_loc = display_loc.title()
 
             if self.weather_units == "C":
                 msg = (
@@ -481,7 +560,6 @@ class ChannelLLMBot:
                 print("[DBG] No valid WEATHER_SCHEDULED_TIMES parsed.")
             return
 
-        # Safe fix: track full date+time key, not just minute
         last_sent_key: Optional[Tuple[int, int, int, int]] = None
 
         while True:
@@ -622,11 +700,6 @@ class ChannelLLMBot:
         snr = p.get("SNR") or p.get("snr") or p.get("rxSnr") or p.get("rx_snr")
         rssi = p.get("RSSI") or p.get("rssi") or p.get("rxRssi") or p.get("rx_rssi")
 
-        if snr is None:
-            snr = self._last_telemetry.get("snr")
-        if rssi is None:
-            rssi = self._last_telemetry.get("rssi")
-
         path_len = p.get("path_len")
         hops = None
         if path_len is not None:
@@ -644,7 +717,12 @@ class ChannelLLMBot:
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
-        safe_hops = hops if hops is not None else "?"
+        if hops is None:
+            safe_hops = "?"
+        elif hops == 0:
+            safe_hops = "Direct"
+        else:
+            safe_hops = hops
 
         try:
             return self.ping_template.format(snr=safe_snr, rssi=safe_rssi, hops=safe_hops)
@@ -672,6 +750,9 @@ class ChannelLLMBot:
             return
 
         ch_idx = p.get("channel_idx")
+        if not isinstance(ch_idx, int):
+            return
+
         is_ai_chan = ch_idx in self.ai_channels
         is_weather_chan = ch_idx in self.weather_channels
 
@@ -689,7 +770,7 @@ class ChannelLLMBot:
 
         sender_id = self.get_sender_identity(p, sender)
 
-        if await self.dedupe_drop("chan", int(ch_idx), sender_id, sender_ts, body):
+        if await self.dedupe_drop("chan", ch_idx, sender_id, sender_ts, body):
             return
 
         body_lower = body.lower()
@@ -702,7 +783,10 @@ class ChannelLLMBot:
 
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            matched = await self.match_telemetry_for_message(False, p)
+            merged = dict(p)
+            merged.update({k: v for k, v in matched.items() if v is not None})
+            reply_text = self.get_telemetry_string(merged)
             await self.send_channel_text(ch_idx, reply_text, sender)
             return
 
@@ -720,7 +804,6 @@ class ChannelLLMBot:
             if not user:
                 return
 
-            # Safe fix: do NOT append user before building conversation
             async with self._llm_lock:
                 conversation = self.build_conversation(ch_idx, user)
 
@@ -784,7 +867,10 @@ class ChannelLLMBot:
 
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            reply_text = self.get_telemetry_string(p)
+            matched = await self.match_telemetry_for_message(True, p)
+            merged = dict(p)
+            merged.update({k: v for k, v in matched.items() if v is not None})
+            reply_text = self.get_telemetry_string(merged)
             await self.send_dm_text(dst, reply_text)
             return
 
@@ -806,7 +892,6 @@ class ChannelLLMBot:
                 ml = self.history[list(self.ai_channels.keys())[0]].maxlen if self.ai_channels else 12
                 self.history[dummy_idx] = deque(maxlen=ml)
 
-            # Safe fix: do NOT append user before building conversation
             conversation = self.build_conversation(dummy_idx, user)
 
             try:
@@ -987,46 +1072,11 @@ async def main() -> None:
         mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
         mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
 
+        mesh.subscribe(EventType.RX_LOG_DATA, bot.on_rx_log_data)
         mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
         mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
 
         await bot.refresh_contacts_best_effort()
-
-        async def telemetry_harvester() -> None:
-            if debug:
-                print("[DBG] Telemetry harvester task started.")
-            try:
-                if hasattr(mesh, "events"):
-                    if debug:
-                        print("[DBG] mesh.events iterator found, listening for raw data...")
-                    async for event in mesh.events:
-                        ev_type = getattr(event, "type", None)
-                        if debug:
-                            print(f"[DBG] Harvester caught raw event type: {ev_type}")
-
-                        payload = getattr(event, "payload", None)
-                        if payload:
-                            rssi = getattr(payload, "rssi", None) or getattr(payload, "rx_rssi", None)
-                            snr = getattr(payload, "snr", None) or getattr(payload, "rx_snr", None)
-
-                            if isinstance(payload, dict):
-                                rssi = rssi if rssi is not None else (payload.get("rssi") or payload.get("rx_rssi"))
-                                snr = snr if snr is not None else (payload.get("snr") or payload.get("rx_snr"))
-
-                            if rssi is not None or snr is not None:
-                                bot._last_telemetry = {"rssi": rssi, "snr": snr}
-                                if debug:
-                                    print(f"[DBG] Harvester Saved Telemetry: RSSI={rssi}, SNR={snr}")
-                else:
-                    if debug:
-                        print("[DBG] No mesh.events attribute found on this version of meshcore.")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if debug:
-                    print(f"[DBG] Telemetry harvester stopped: {e}")
-
-        tasks.append(asyncio.create_task(telemetry_harvester(), name="telemetry_harvester"))
 
         if weather_times and weather_location and weather_channel_map:
             tasks.append(asyncio.create_task(bot.scheduled_weather_loop(), name="scheduled_weather"))
