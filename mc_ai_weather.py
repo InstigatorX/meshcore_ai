@@ -27,7 +27,12 @@ Telemetry fix applied:
 - Match !ping replies against recent RX_LOG_DATA entries by:
   - expected message type (GRP_TXT for channels, TEXT_MSG for DMs)
   - matching path_len
-  - closest recv_time to sender_timestamp
+  - closest local process arrival time
+- Retry telemetry match once after a short delay to avoid event-order races
+
+Minor tweaks applied:
+- Preserve uppercase location names like AVL
+- Render 0 hops as "Direct"
 """
 
 import asyncio
@@ -299,13 +304,11 @@ class ChannelLLMBot:
 
         self._dedupe_lock = asyncio.Lock()
         self._seen_ts: Dict[Tuple[str, int, str, int, str], float] = {}
-        # key = (scope, ch, sender_id, sender_ts, body) -> time
 
         self._contacts_lock = asyncio.Lock()
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}
 
-        # RX log rolling buffer for matching telemetry to decoded messages
         self._rxlog_lock = asyncio.Lock()
         self._recent_rxlog: Deque[Dict[str, Any]] = deque(maxlen=100)
 
@@ -382,17 +385,30 @@ class ChannelLLMBot:
     # ---------------- RX log telemetry matching ----------------
 
     async def on_rx_log_data(self, ev) -> None:
-        p = ev.payload or {}
-        if not isinstance(p, dict):
-            return
+        payload = ev.payload or {}
+        attrs = getattr(ev, "attributes", None) or {}
+
+        if not isinstance(payload, dict):
+            payload = {}
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        def pick(*keys):
+            for k in keys:
+                if k in payload and payload.get(k) is not None:
+                    return payload.get(k)
+                if k in attrs and attrs.get(k) is not None:
+                    return attrs.get(k)
+            return None
 
         entry = {
-            "recv_time": p.get("recv_time"),
-            "snr": p.get("snr"),
-            "rssi": p.get("rssi"),
-            "path_len": p.get("path_len"),
-            "payload_typename": p.get("payload_typename"),
-            "pkt_hash": p.get("pkt_hash"),
+            "local_ts": time.monotonic(),
+            "recv_time": pick("recv_time"),
+            "snr": pick("snr", "rx_snr", "SNR", "rxSnr"),
+            "rssi": pick("rssi", "rx_rssi", "RSSI", "rxRssi"),
+            "path_len": pick("path_len"),
+            "payload_typename": pick("payload_typename"),
+            "pkt_hash": pick("pkt_hash"),
         }
 
         async with self._rxlog_lock:
@@ -404,55 +420,95 @@ class ChannelLLMBot:
                 f"type={entry['payload_typename']} "
                 f"path_len={entry['path_len']} "
                 f"snr={entry['snr']} rssi={entry['rssi']} "
-                f"recv_time={entry['recv_time']}"
+                f"local_ts={entry['local_ts']:.3f}"
             )
 
-    async def match_telemetry_for_message(self, is_dm: bool, msg_payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def match_telemetry_for_message(
+        self,
+        is_dm: bool,
+        msg_payload: Dict[str, Any],
+        msg_local_ts: float,
+) -> Dict[str, Any]:
         expected_type = "TEXT_MSG" if is_dm else "GRP_TXT"
         msg_path_len = msg_payload.get("path_len")
-        sender_ts = msg_payload.get("sender_timestamp")
 
         async with self._rxlog_lock:
             candidates = list(self._recent_rxlog)
 
-        best: Optional[Dict[str, Any]] = None
-        best_score: Optional[int] = None
+        candidates = [
+            c for c in candidates
+            if isinstance(c.get("local_ts"), (int, float))
+            and abs(float(c["local_ts"]) - msg_local_ts) <= 2.0
+        ]
+
+        scored: List[Tuple[int, float, Dict[str, Any]]] = []
 
         for c in candidates:
-            if c.get("payload_typename") != expected_type:
+            if c.get("snr") is None and c.get("rssi") is None:
                 continue
 
             score = 0
 
-            if msg_path_len is not None and c.get("path_len") == msg_path_len:
-                score += 100
+            # If type is available, use it as a strong preference.
+            # If missing, do not reject the entry.
+            rx_type = c.get("payload_typename")
+            if rx_type is not None:
+                if rx_type == expected_type:
+                    score += 60
+                else:
+                    score -= 40
 
-            recv_time = c.get("recv_time")
-            if isinstance(sender_ts, int) and isinstance(recv_time, int):
-                dt = abs(recv_time - sender_ts)
-                if dt > 30:
-                    continue
-                score += max(0, 30 - dt)
+            # If path_len is available, use it as a preference.
+            # If missing, do not reject the entry.
+            rx_path_len = c.get("path_len")
+            if msg_path_len is not None and rx_path_len is not None:
+                try:
+                    if int(rx_path_len) == int(msg_path_len):
+                        score += 40
+                    else:
+                        score -= abs(int(rx_path_len) - int(msg_path_len)) * 10
+                except (ValueError, TypeError):
+                    pass
 
-            if best is None or best_score is None or score > best_score:
-                best = c
-                best_score = score
+            # Closest local arrival time is now the primary signal
+            dt_local = abs(float(c["local_ts"]) - msg_local_ts)
+            score += max(0, int((2.0 - dt_local) * 100))
 
-        if self.debug:
-            if best:
-                print(
-                    "[DBG] matched telemetry "
-                    f"expected_type={expected_type} msg_path_len={msg_path_len} "
-                    f"snr={best.get('snr')} rssi={best.get('rssi')} "
-                    f"rx_path_len={best.get('path_len')} recv_time={best.get('recv_time')}"
-                )
-            else:
+            scored.append((score, -dt_local, c))
+
+        if not scored:
+            if self.debug:
                 print(
                     "[DBG] no telemetry match "
-                    f"expected_type={expected_type} msg_path_len={msg_path_len} sender_ts={sender_ts}"
+                    f"expected_type={expected_type} msg_path_len={msg_path_len} "
+                    f"msg_local_ts={msg_local_ts:.3f}"
                 )
+                print("[DBG] candidate RX logs:")
+                for c in candidates[-8:]:
+                    print(
+                        f"  type={c.get('payload_typename')} "
+                        f"path_len={c.get('path_len')} "
+                        f"snr={c.get('snr')} "
+                        f"rssi={c.get('rssi')} "
+                        f"local_ts={c.get('local_ts')}"
+                    )
+            return {}
 
-        return best or {}
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = scored[0][2]
+
+        if self.debug:
+            print(
+                "[DBG] matched telemetry "
+                f"expected_type={expected_type} msg_path_len={msg_path_len} "
+                f"snr={best.get('snr')} rssi={best.get('rssi')} "
+                f"rx_path_len={best.get('path_len')} "
+                f"rx_type={best.get('payload_typename')} "
+                f"rx_local_ts={best.get('local_ts'):.3f} "
+                f"msg_local_ts={msg_local_ts:.3f}"
+            )
+
+        return best
 
     # ---------------- Weather & Alerts Logic ----------------
 
@@ -491,9 +547,7 @@ class ChannelLLMBot:
             max_snow = max(snow_chances) if snow_chances else 0
 
             display_loc = location.strip()
-            if display_loc.isupper():
-                pass
-            else:
+            if not display_loc.isupper():
                 display_loc = display_loc.title()
 
             if self.weather_units == "C":
@@ -542,7 +596,6 @@ class ChannelLLMBot:
                     await asyncio.sleep(2)
 
     async def scheduled_weather_loop(self) -> None:
-        """Broadcast weather at configured times of day to weather channels."""
         if not self.weather_times or not self.weather_location or not self.weather_channels:
             return
 
@@ -581,7 +634,6 @@ class ChannelLLMBot:
             await asyncio.sleep(10)
 
     async def weather_alerts_loop(self, zones: str, interval_m: float) -> None:
-        """Poll the NWS API periodically and broadcast to weather channels."""
         if not zones or interval_m <= 0 or not self.weather_channels:
             return
 
@@ -649,7 +701,6 @@ class ChannelLLMBot:
         return b[idx + len(self.trigger):].strip(" \t:,-")
 
     def get_sender_identity(self, payload: Dict[str, Any], sender: str) -> str:
-        """Best-effort stable sender id for dedupe when timestamp is missing."""
         for key in ("public_key", "pubkey_prefix", "sender", "sender_id", "from"):
             v = payload.get(key)
             if isinstance(v, str) and v.strip():
@@ -749,6 +800,8 @@ class ChannelLLMBot:
         if not isinstance(p, dict):
             return
 
+        msg_local_ts = time.monotonic()
+
         ch_idx = p.get("channel_idx")
         if not isinstance(ch_idx, int):
             return
@@ -783,7 +836,11 @@ class ChannelLLMBot:
 
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            matched = await self.match_telemetry_for_message(False, p)
+            matched = await self.match_telemetry_for_message(False, p, msg_local_ts)
+            if not matched:
+                await asyncio.sleep(0.22)
+                matched = await self.match_telemetry_for_message(False, p, time.monotonic())
+
             merged = dict(p)
             merged.update({k: v for k, v in matched.items() if v is not None})
             reply_text = self.get_telemetry_string(merged)
@@ -833,6 +890,8 @@ class ChannelLLMBot:
         if not isinstance(p, dict):
             return
 
+        msg_local_ts = time.monotonic()
+
         text = p.get("text")
         if not isinstance(text, str):
             return
@@ -867,7 +926,11 @@ class ChannelLLMBot:
 
         p_trigger = self.ping_trigger.lower()
         if body_lower == p_trigger or body_lower.startswith(p_trigger + " "):
-            matched = await self.match_telemetry_for_message(True, p)
+            matched = await self.match_telemetry_for_message(True, p, msg_local_ts)
+            if not matched:
+                await asyncio.sleep(0.22)
+                matched = await self.match_telemetry_for_message(True, p, time.monotonic())
+
             merged = dict(p)
             merged.update({k: v for k, v in matched.items() if v is not None})
             reply_text = self.get_telemetry_string(merged)
@@ -938,10 +1001,6 @@ async def create_mesh_connection() -> MeshCore:
 
 
 async def watchdog_loop(mesh: MeshCore, debug: bool) -> None:
-    """
-    Ping the node periodically. If the TCP/Serial connection goes dead,
-    exit the script so Docker can restart it.
-    """
     while True:
         await asyncio.sleep(60)
         try:
