@@ -280,8 +280,6 @@ class ChannelLLMBot:
         self._contacts_by_pubkey: Dict[str, Dict[str, Any]] = {}
         self._contacts_by_prefix: Dict[str, str] = {}  # prefix -> pubkey
         
-        # Telemetry Cache for intercepting raw radio metrics
-        self._telemetry_cache: Dict[int, Dict[str, Any]] = {}
         self._last_telemetry: Dict[str, Any] = {}
 
     # ---------------- Contacts ----------------
@@ -569,33 +567,32 @@ class ChannelLLMBot:
         return "Commands: " + ", ".join(cmds)
 
     def get_telemetry_string(self, p: Dict[str, Any]) -> str:
-        """Extracts network telemetry using the cached raw message data."""
-        sender_ts = p.get("sender_timestamp")
+        """Extracts network telemetry from the payload and formats it using the template."""
         
-        # Check cache
-        cached = {}
-        if sender_ts is not None:
-            try:
-                cached = self._telemetry_cache.get(int(sender_ts), {})
-            except Exception:
-                pass
+        # Try finding telemetry in the parsed dictionary first
+        snr = p.get("SNR") or p.get("rxSnr") or p.get("rx_snr") or p.get("snr")
+        rssi = p.get("RSSI") or p.get("rxRssi") or p.get("rx_rssi") or p.get("rssi")
         
-        # Fallback to the last known telemetry if no specific match
-        if not cached and self._last_telemetry:
-            cached = self._last_telemetry
-
-        # Prioritize cached (raw) stats over p (parsed) because p often drops them
-        snr = cached.get("snr") if cached.get("snr") is not None else (p.get("SNR") or p.get("snr") or p.get("rxSnr") or p.get("rx_snr"))
-        rssi = cached.get("rssi") if cached.get("rssi") is not None else (p.get("RSSI") or p.get("rssi") or p.get("rxRssi") or p.get("rx_rssi"))
+        # Fallback to the background harvester cache
+        if snr is None: 
+            snr = self._last_telemetry.get("snr")
+        if rssi is None: 
+            rssi = self._last_telemetry.get("rssi")
         
         path_len = p.get("path_len")
         hops = None
         if path_len is not None:
             hops = path_len
         else:
-            hl = cached.get("hop_limit") if cached.get("hop_limit") is not None else (p.get("hopLimit") or p.get("hop_limit"))
-            if hl is not None:
-                hops = f"Limit {hl}"
+            hop_limit = p.get("hopLimit") or p.get("hop_limit")
+            hop_start = p.get("hopStart") or p.get("hop_start")
+            if hop_limit is not None:
+                try:
+                    hl = int(hop_limit)
+                    hs = int(hop_start) if hop_start is not None else hl
+                    hops = (hs - hl) if hs >= hl else 0
+                except (ValueError, TypeError):
+                    pass
 
         safe_snr = snr if snr is not None else "?"
         safe_rssi = rssi if rssi is not None else "?"
@@ -609,42 +606,6 @@ class ChannelLLMBot:
             return f"pong [SNR: {safe_snr}, RSSI: {safe_rssi}dBm, Hops: {safe_hops}]"
 
     # ---------------- Event handlers ----------------
-
-    async def on_raw_message(self, ev) -> None:
-        """Intercept EventType.MESSAGE to grab raw radio metrics (RSSI/SNR)."""
-        if not ev or not hasattr(ev, "payload"):
-            return
-        payload = ev.payload
-
-        # Pull from object attributes
-        rssi = getattr(payload, "rssi", None) or getattr(payload, "rx_rssi", None)
-        snr = getattr(payload, "snr", None) or getattr(payload, "rx_snr", None)
-        hop_limit = getattr(payload, "hop_limit", None)
-        
-        ts = getattr(payload, "timestamp", None) or getattr(payload, "time", None) or getattr(payload, "sender_timestamp", None)
-
-        # Fallback to dictionary access if payload acts like a dict
-        if isinstance(payload, dict):
-            rssi = rssi or payload.get("rssi") or payload.get("rx_rssi")
-            snr = snr or payload.get("snr") or payload.get("rx_snr")
-            hop_limit = hop_limit or payload.get("hop_limit")
-            ts = ts or payload.get("timestamp") or payload.get("time") or payload.get("sender_timestamp")
-
-        telemetry = {}
-        if rssi is not None: telemetry["rssi"] = rssi
-        if snr is not None: telemetry["snr"] = snr
-        if hop_limit is not None: telemetry["hop_limit"] = hop_limit
-
-        if telemetry:
-            self._last_telemetry = telemetry
-            if ts is not None:
-                try:
-                    self._telemetry_cache[int(ts)] = telemetry
-                    if len(self._telemetry_cache) > 20:
-                        oldest = min(self._telemetry_cache.keys())
-                        del self._telemetry_cache[oldest]
-                except Exception:
-                    pass
 
     async def on_channel_msg(self, ev) -> None:
         p = ev.payload or {}
@@ -937,129 +898,113 @@ async def main() -> None:
     else:
         raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
-    # --------------------------------------------------------------------------
-    # Connect and Setup
-    # --------------------------------------------------------------------------
-    print("[INFO] Establishing connection to node...")
-    
-    # --------------------------------------------------------------------------
-    # The supervisor loop requested by the user's baseline paste
-    # --------------------------------------------------------------------------
-    while True:
-        mesh = None
-        bg_tasks = []
+    mesh = await create_mesh_connection()
+    await mesh.start_auto_message_fetching()
+
+    # Resolve requested channels into dictionaries {index: name}
+    ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
+    weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
+
+    print("[OK] AI Channel map:")
+    if not ai_channel_map:
+        print("  (None configured)")
+    for idx, name in ai_channel_map.items():
+        print(f"  idx={idx} -> {name}")
+
+    print("[OK] Weather Channel map:")
+    if not weather_channel_map:
+        print("  (None configured)")
+    for idx, name in weather_channel_map.items():
+        print(f"  idx={idx} -> {name}")
+
+    bot = ChannelLLMBot(
+        mesh=mesh,
+        llm=llm,
+        ai_channels=ai_channel_map,
+        weather_channels=weather_channel_map,
+        trigger=trigger,
+        ping_trigger=ping_trigger,
+        help_trigger=help_trigger,
+        ping_template=ping_template,
+        max_reply_chars=max_reply_chars,
+        history_turns=history_turns,
+        dedupe_window_s=dedupe_window_s,
+        debug=debug,
+        system_prompt=system_prompt,
+        weather_location=weather_location,
+        weather_times=weather_times,
+        weather_trigger=weather_trigger,
+        weather_units=weather_units
+    )
+
+    # Contacts/cache feeders
+    mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
+    mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
+    mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
+
+    # Message listeners
+    mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
+    mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
+
+    # Try to warm contacts cache
+    await bot.refresh_contacts_best_effort()
+
+    bg_tasks = []
+
+    # Start background tasks
+    if weather_times and weather_location and weather_channel_map:
+        bg_tasks.append(asyncio.create_task(bot.scheduled_weather_loop()))
+        print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
+        
+    if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
+        bg_tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m)))
+        print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
+
+    # --- START NEW TELEMETRY HARVESTER ---
+    # Listen on EventType.MESSAGE for raw RSSI/SNR as requested by user snippet
+    async def telemetry_harvester():
         try:
-            mesh = await create_mesh_connection()
-            await mesh.start_auto_message_fetching()
-
-            # Resolve requested channels into dictionaries {index: name}
-            ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
-            weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
-
-            print("[OK] AI Channel map:")
-            if not ai_channel_map:
-                print("  (None configured)")
-            for idx, name in ai_channel_map.items():
-                print(f"  idx={idx} -> {name}")
-
-            print("[OK] Weather Channel map:")
-            if not weather_channel_map:
-                print("  (None configured)")
-            for idx, name in weather_channel_map.items():
-                print(f"  idx={idx} -> {name}")
-
-            bot = ChannelLLMBot(
-                mesh=mesh,
-                llm=llm,
-                ai_channels=ai_channel_map,
-                weather_channels=weather_channel_map,
-                trigger=trigger,
-                ping_trigger=ping_trigger,
-                help_trigger=help_trigger,
-                ping_template=ping_template,
-                max_reply_chars=max_reply_chars,
-                history_turns=history_turns,
-                dedupe_window_s=dedupe_window_s,
-                debug=debug,
-                system_prompt=system_prompt,
-                weather_location=weather_location,
-                weather_times=weather_times,
-                weather_trigger=weather_trigger,
-                weather_units=weather_units
-            )
-
-            # Contacts/cache feeders
-            mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
-            mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
-            mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
-
-            # Intercept raw messages for telemetry tracking BEFORE they become parsed text events
-            mesh.subscribe(EventType.MESSAGE, bot.on_raw_message)
-
-            # Message listeners
-            mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
-            mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
-
-            # Try to warm contacts cache
-            await bot.refresh_contacts_best_effort()
-
-            # Start background tasks
-            if weather_times and weather_location and weather_channel_map:
-                bg_tasks.append(asyncio.create_task(bot.scheduled_weather_loop()))
-                print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={weather_units}")
-                
-            if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
-                bg_tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m)))
-                print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
-
-            print(f"\n[OK] Connected and Listening.")
-            print(f"[LLM] Backend={backend}")
-            print(f"--- COMMANDS ---")
-            print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
-            print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
-            print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
-            print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
-
-            # Health check loop
-            while True:
-                await asyncio.sleep(30)
-                try:
-                    # Request channel 0 to prove the node is still actively responding over TCP/Serial
-                    await asyncio.wait_for(mesh.commands.get_channel(0), timeout=15.0)
-                except asyncio.TimeoutError:
-                    print("\n[ERR] Node health check timed out. Connection is dead.")
-                    break # Break inner loop to trigger supervisor restart
-                except Exception as e:
-                    print(f"\n[ERR] Node health check failed: {e}")
-                    break # Break inner loop to trigger supervisor restart
-
+            if hasattr(mesh, "events"):
+                async for event in mesh.events:
+                    if getattr(event, "type", None) == getattr(EventType, "MESSAGE", None):
+                        payload = getattr(event, "payload", None)
+                        if payload:
+                            # Extract values exactly as requested
+                            rssi = getattr(payload, "rssi", None)
+                            snr = getattr(payload, "snr", None)
+                            
+                            # Dictionary fallbacks just in case
+                            if rssi is None and isinstance(payload, dict):
+                                rssi = payload.get("rssi") or payload.get("rx_rssi")
+                            if snr is None and isinstance(payload, dict):
+                                snr = payload.get("snr") or payload.get("rx_snr")
+                                
+                            if rssi is not None or snr is not None:
+                                bot._last_telemetry = {"rssi": rssi, "snr": snr}
+                                if debug:
+                                    print(f"[DBG] Harvester caught telemetry: RSSI={rssi}, SNR={snr}")
         except Exception as e:
-            if not isinstance(e, SystemExit):
-                print(f"\n[ERR] Fatal connection error: {e}")
-            else:
-                # Let bad config errors kill the script immediately
-                raise
+            if debug: print(f"[DBG] Telemetry harvester stopped: {e}")
 
-        finally:
-            print("[INFO] Cleaning up tasks and connection...")
-            for t in bg_tasks:
-                t.cancel()
-            
-            if mesh:
-                try:
-                    if hasattr(mesh, "disconnect"):
-                        await getattr(mesh, "disconnect")()
-                    elif hasattr(mesh, "close"):
-                        await getattr(mesh, "close")()
-                except Exception:
-                    pass
+    bg_tasks.append(asyncio.create_task(telemetry_harvester()))
+    # --- END NEW TELEMETRY HARVESTER ---
 
-        print("[INFO] Supervisor waiting 10 seconds before attempting to reconnect...\n")
-        await asyncio.sleep(10)
+    # Start Watchdog
+    bg_tasks.append(asyncio.create_task(watchdog_loop(mesh, debug)))
+
+    print(f"\n[OK] Connected and Listening.")
+    print(f"[LLM] Backend={backend}")
+    print(f"--- COMMANDS ---")
+    print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
+    print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
+    print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
+    print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
+
+    await asyncio.sleep(float("inf"))
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user.")
+        pass
