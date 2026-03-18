@@ -7,7 +7,7 @@ MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
 + Configurable polling for US National Weather Service (NWS) severe weather alerts.
 + Global `!ping` command for testing connectivity (returns SNR, RSSI, and Hops).
 + Global `!help` command listing available triggers based on context.
-+ Watchdog loop: Detects dead TCP links and exits so Docker can automatically restart it.
++ Watchdog loop: Detects dead links by idle time since last received MeshCore event.
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts. DMs support all commands.
@@ -33,6 +33,11 @@ Telemetry fix applied:
 Minor tweaks applied:
 - Preserve uppercase location names like AVL
 - Render 0 hops as "Direct"
+
+Watchdog fixes applied:
+- No more fragile get_channel(0) liveness probe
+- No more os._exit(1) hard exit
+- Watchdog now tracks idle time since last received MeshCore event
 """
 
 import asyncio
@@ -53,6 +58,10 @@ try:
     from google import genai  # type: ignore
 except Exception:
     genai = None  # noqa: N816
+
+
+class WatchdogTimeout(RuntimeError):
+    pass
 
 
 def env_int(name: str, default: int) -> int:
@@ -86,7 +95,7 @@ def chunk_text(text: str, max_len: int) -> List[str]:
 
     chunks: List[str] = []
     cur = ""
-    for tok in re.split(r"(\s+)", text):  # keep whitespace
+    for tok in re.split(r"(\s+)", text):
         if len(cur) + len(tok) <= max_len:
             cur += tok
         else:
@@ -99,7 +108,6 @@ def chunk_text(text: str, max_len: int) -> List[str]:
 
 
 async def resolve_channels(mesh: MeshCore, channel_names: List[str], max_channels: int = 16) -> Dict[int, str]:
-    """Find indices for multiple channel names. Returns {idx: normalized_name}."""
     if not channel_names:
         return {}
 
@@ -312,6 +320,11 @@ class ChannelLLMBot:
         self._rxlog_lock = asyncio.Lock()
         self._recent_rxlog: Deque[Dict[str, Any]] = deque(maxlen=100)
 
+        self.last_activity_ts = time.monotonic()
+
+    def mark_activity(self) -> None:
+        self.last_activity_ts = time.monotonic()
+
     # ---------------- Contacts ----------------
 
     async def upsert_contact(self, contact: Dict[str, Any]) -> None:
@@ -330,6 +343,8 @@ class ChannelLLMBot:
             print(f"[DBG] cached contact pubkey_prefix={prefix} name={name}")
 
     async def on_contacts_event(self, ev) -> None:
+        self.mark_activity()
+
         p = ev.payload or {}
         if not isinstance(p, dict):
             return
@@ -385,6 +400,8 @@ class ChannelLLMBot:
     # ---------------- RX log telemetry matching ----------------
 
     async def on_rx_log_data(self, ev) -> None:
+        self.mark_activity()
+
         payload = ev.payload or {}
         attrs = getattr(ev, "attributes", None) or {}
 
@@ -428,7 +445,7 @@ class ChannelLLMBot:
         is_dm: bool,
         msg_payload: Dict[str, Any],
         msg_local_ts: float,
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         expected_type = "TEXT_MSG" if is_dm else "GRP_TXT"
         msg_path_len = msg_payload.get("path_len")
 
@@ -449,8 +466,6 @@ class ChannelLLMBot:
 
             score = 0
 
-            # If type is available, use it as a strong preference.
-            # If missing, do not reject the entry.
             rx_type = c.get("payload_typename")
             if rx_type is not None:
                 if rx_type == expected_type:
@@ -458,8 +473,6 @@ class ChannelLLMBot:
                 else:
                     score -= 40
 
-            # If path_len is available, use it as a preference.
-            # If missing, do not reject the entry.
             rx_path_len = c.get("path_len")
             if msg_path_len is not None and rx_path_len is not None:
                 try:
@@ -470,7 +483,6 @@ class ChannelLLMBot:
                 except (ValueError, TypeError):
                     pass
 
-            # Closest local arrival time is now the primary signal
             dt_local = abs(float(c["local_ts"]) - msg_local_ts)
             score += max(0, int((2.0 - dt_local) * 100))
 
@@ -483,15 +495,6 @@ class ChannelLLMBot:
                     f"expected_type={expected_type} msg_path_len={msg_path_len} "
                     f"msg_local_ts={msg_local_ts:.3f}"
                 )
-                print("[DBG] candidate RX logs:")
-                for c in candidates[-8:]:
-                    print(
-                        f"  type={c.get('payload_typename')} "
-                        f"path_len={c.get('path_len')} "
-                        f"snr={c.get('snr')} "
-                        f"rssi={c.get('rssi')} "
-                        f"local_ts={c.get('local_ts')}"
-                    )
             return {}
 
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -513,23 +516,55 @@ class ChannelLLMBot:
     # ---------------- Weather & Alerts Logic ----------------
 
     async def fetch_weather(self, location: str) -> str:
-        """Fetch current weather and today's forecast from wttr.in."""
         if not location:
             return "No weather location specified."
-
+    
         loc_encoded = urllib.parse.quote(location)
         url = f"https://wttr.in/{loc_encoded}?format=j1"
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                headers={"User-Agent": "meshcore-llm-bot/1.0"}
+            ) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
+
+                content_type = resp.headers.get("content-type", "")
+                raw_text = resp.text
+
+                if self.debug:
+                    print(f"[DBG] wttr status={resp.status_code} content-type={content_type}")
+                    print(f"[DBG] wttr first 300 chars: {raw_text[:300]!r}")
+
                 data = resp.json()
 
-            current = data.get("current_condition", [{}])[0]
-            today = data.get("weather", [{}])[0]
+                # wttr sometimes wraps payload under top-level "data"
+                if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                    data = data["data"]
 
-            cond = current.get("weatherDesc", [{"value": "Unknown"}])[0].get("value", "Unknown")
+                current_list = data.get("current_condition")
+                weather_list = data.get("weather")
+
+            if not isinstance(current_list, list) or not current_list:
+                if self.debug:
+                    print(f"[DBG] wttr missing current_condition. keys={list(data.keys())}")
+                return f"Weather unavailable for '{location}' right now."
+
+            if not isinstance(weather_list, list) or not weather_list:
+                if self.debug:
+                    print(f"[DBG] wttr missing weather forecast. keys={list(data.keys())}")
+                return f"Forecast unavailable for '{location}' right now."
+
+            current = current_list[0] if isinstance(current_list[0], dict) else {}
+            today = weather_list[0] if isinstance(weather_list[0], dict) else {}
+
+            weather_desc_list = current.get("weatherDesc")
+            if isinstance(weather_desc_list, list) and weather_desc_list and isinstance(weather_desc_list[0], dict):
+                cond = weather_desc_list[0].get("value", "Unknown")
+            else:
+                cond = "Unknown"
+
             temp_f = current.get("temp_F", "?")
             temp_c = current.get("temp_C", "?")
             wind_mph = current.get("windspeedMiles", "?")
@@ -540,9 +575,23 @@ class ChannelLLMBot:
             low_f = today.get("mintempF", "?")
             high_c = today.get("maxtempC", "?")
             low_c = today.get("mintempC", "?")
+    
+            hourly = today.get("hourly", [])
+            rain_chances = []
+            snow_chances = []
+            if isinstance(hourly, list):
+                for h in hourly:
+                    if not isinstance(h, dict):
+                        continue
+                    try:
+                        rain_chances.append(int(h.get("chanceofrain", "0")))
+                    except Exception:
+                        pass
+                    try:
+                        snow_chances.append(int(h.get("chanceofsnow", "0")))
+                    except Exception:
+                        pass
 
-            rain_chances = [int(h.get("chanceofrain", "0")) for h in today.get("hourly", [])]
-            snow_chances = [int(h.get("chanceofsnow", "0")) for h in today.get("hourly", [])]
             max_rain = max(rain_chances) if rain_chances else 0
             max_snow = max(snow_chances) if snow_chances else 0
 
@@ -785,16 +834,7 @@ class ChannelLLMBot:
     # ---------------- Event handlers ----------------
 
     async def on_channel_msg(self, ev) -> None:
-        if self.debug:
-            print(f"\n[DBG] === ON_CHANNEL_MSG EVENT ===")
-            print(f"[DBG] Event type: {type(ev)}")
-            print(f"[DBG] dir(ev): {dir(ev)}")
-            try:
-                print(f"[DBG] vars(ev): {vars(ev)}")
-            except Exception:
-                pass
-            print(f"[DBG] payload: {getattr(ev, 'payload', 'N/A')}")
-            print("[DBG] ============================\n")
+        self.mark_activity()
 
         p = ev.payload or {}
         if not isinstance(p, dict):
@@ -875,16 +915,7 @@ class ChannelLLMBot:
             await self.send_channel_text(ch_idx, answer, sender)
 
     async def on_dm_msg(self, ev) -> None:
-        if self.debug:
-            print(f"\n[DBG] === ON_DM_MSG EVENT ===")
-            print(f"[DBG] Event type: {type(ev)}")
-            print(f"[DBG] dir(ev): {dir(ev)}")
-            try:
-                print(f"[DBG] vars(ev): {vars(ev)}")
-            except Exception:
-                pass
-            print(f"[DBG] payload: {getattr(ev, 'payload', 'N/A')}")
-            print("[DBG] =======================\n")
+        self.mark_activity()
 
         p = ev.payload or {}
         if not isinstance(p, dict):
@@ -1000,19 +1031,21 @@ async def create_mesh_connection() -> MeshCore:
     raise SystemExit("MESHCORE_TRANSPORT must be one of: tcp | serial")
 
 
-async def watchdog_loop(mesh: MeshCore, debug: bool) -> None:
+async def watchdog_loop(bot: ChannelLLMBot, debug: bool) -> None:
+    idle_timeout_s = env_int("WATCHDOG_IDLE_TIMEOUT_S", 300)
+    check_interval_s = env_int("WATCHDOG_CHECK_INTERVAL_S", 30)
+
     while True:
-        await asyncio.sleep(60)
-        try:
-            if debug:
-                print("[DBG] Watchdog checking node connection...")
-            await asyncio.wait_for(mesh.commands.get_channel(0), timeout=15.0)
-            if debug:
-                print("[DBG] Watchdog OK.")
-        except Exception as e:
-            print(f"\n[ERR] Watchdog detected dead connection: {e}")
-            print("[INFO] Exiting so Docker can restart the container...\n")
-            os._exit(1)
+        await asyncio.sleep(check_interval_s)
+        idle = time.monotonic() - bot.last_activity_ts
+
+        if debug:
+            print(f"[DBG] Watchdog idle={idle:.1f}s timeout={idle_timeout_s}s")
+
+        if idle > idle_timeout_s:
+            raise WatchdogTimeout(
+                f"No MeshCore events received for {int(idle)}s (timeout={idle_timeout_s}s)"
+            )
 
 
 async def safe_close_mesh(mesh: Any, debug: bool) -> None:
@@ -1145,7 +1178,7 @@ async def main() -> None:
             tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m), name="weather_alerts"))
             print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
-        tasks.append(asyncio.create_task(watchdog_loop(mesh, debug), name="watchdog"))
+        tasks.append(asyncio.create_task(watchdog_loop(bot, debug), name="watchdog"))
 
         print(f"\n[OK] Connected and Listening.")
         print(f"[LLM] Backend={backend}")
@@ -1158,17 +1191,26 @@ async def main() -> None:
         await asyncio.sleep(float("inf"))
 
     finally:
+        task_errors: List[BaseException] = []
+
         for task in tasks:
             task.cancel()
         for task in tasks:
-            with suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                task_errors.append(e)
 
         with suppress(Exception):
             await llm.aclose()
 
         with suppress(Exception):
             await safe_close_mesh(mesh, debug)
+
+        if task_errors:
+            raise task_errors[0]
 
 
 if __name__ == "__main__":
@@ -1177,3 +1219,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted, shutting down.")
         sys.exit(0)
+    except WatchdogTimeout as e:
+        print(f"\n[ERR] Watchdog timeout: {e}")
+        print("[INFO] Exiting cleanly so Docker can restart the container.\n")
+        sys.exit(1)
