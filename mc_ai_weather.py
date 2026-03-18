@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """
 MeshCore -> LLM channel bot (Gemini OR local LLM) + TCP OR USB/Serial transport
-+ separates AI channels and Weather channels.
-+ Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching.
++ separates AI channels and Weather channels
++ Scheduled daily weather broadcasts and on-demand `!weather [location]` fetching
 + Includes today's forecast (High/Low/Rain chance)
-+ Configurable polling for US National Weather Service (NWS) severe weather alerts.
-+ Global `!ping` command for testing connectivity (returns SNR, RSSI, and Hops).
-+ Global `!help` command listing available triggers based on context.
-+ Watchdog loop: Detects dead links by idle time since last received MeshCore event.
++ Configurable polling for US National Weather Service (NWS) severe weather alerts
++ Global `!ping` command for testing connectivity (returns SNR, RSSI, and Hops)
++ Global `!help` command listing available triggers based on context
 
 DM replies require a destination with full 'public_key'. We resolve DM sender via
 pubkey_prefix by caching contacts. DMs support all commands.
 
-Safe fixes applied:
+Reconnect model
+- MeshCore internal auto_reconnect is DISABLED
+- App owns reconnect logic
+- EventType.DISCONNECTED is the PRIMARY reconnect trigger
+- A gentle idle watchdog is the BACKUP trigger
+- Whole session is rebuilt on reconnect so subscriptions/tasks/state reattach cleanly
+
+Safe fixes applied
 - Prevent duplicate latest user turn from being sent to the LLM
 - Fix scheduled weather duplicate/minute logic across different hours
 - Allow AI/weather channel groups to be optional if not found
 - Make dedupe key safer when sender_timestamp is missing
 - Validate weather units
 - Add clean shutdown for HTTP clients / mesh if process exits normally
+- DM/contact cache preserved within a session and rebuilt on reconnect
 
-Telemetry fix applied:
+Telemetry fix applied
 - Remove unsupported/undocumented mesh.events harvester
 - Use EventType.RX_LOG_DATA as telemetry source
 - Keep a small rolling RX log buffer
@@ -30,14 +37,59 @@ Telemetry fix applied:
   - closest local process arrival time
 - Retry telemetry match once after a short delay to avoid event-order races
 
-Minor tweaks applied:
+Minor tweaks applied
 - Preserve uppercase location names like AVL
 - Render 0 hops as "Direct"
 
-Watchdog fixes applied:
-- No more fragile get_channel(0) liveness probe
-- No more os._exit(1) hard exit
-- Watchdog now tracks idle time since last received MeshCore event
+Environment
+  MESHCORE_TRANSPORT=tcp|serial             default: tcp
+  MESHCORE_HOST=...                         required for tcp
+  MESHCORE_PORT=5000
+  MESHCORE_SERIAL_PORT=/dev/ttyACM0         required for serial
+  MESHCORE_SERIAL_BAUD=115200
+  MESHCORE_AI_CHANNELS=#avl-ai
+  MESHCORE_WEATHER_CHANNELS=#weather-avl
+  CHANNEL_SCAN_MAX=16
+
+  AI_TRIGGER=!ai
+  PING_TRIGGER=!ping
+  HELP_TRIGGER=!help
+  WEATHER_TRIGGER=!weather
+  PING_TEMPLATE="pong [SNR: {snr}, RSSI: {rssi}dBm, Hops: {hops}]"
+
+  MAX_REPLY_CHARS=180
+  HISTORY_TURNS=6
+  DEDUPE_WINDOW_S=3.0
+  DEBUG=0
+
+  WEATHER_LOCATION=Asheville, NC
+  WEATHER_SCHEDULED_TIMES=07:30,18:00
+  WEATHER_UNITS=F
+  WEATHER_ALERTS_NWS_ZONES=NCZ053,NCC021
+  WEATHER_ALERTS_POLL_INTERVAL_M=15
+
+  RECONNECT_DELAY_S=5
+  RECONNECT_MAX_DELAY_S=60
+
+  WATCHDOG_IDLE_TIMEOUT_S=300
+  WATCHDOG_CHECK_INTERVAL_S=30
+  WATCHDOG_PROBE_TIMEOUT_S=8
+  WATCHDOG_PROBE_RETRIES=2
+
+  LLM_BACKEND=gemini|ollama|openai_compat
+  SYSTEM_PROMPT=...
+
+  GEMINI_API_KEY=...
+  GEMINI_MODEL=gemini-3-flash-preview
+
+  OLLAMA_BASE_URL=http://127.0.0.1:11434
+  OLLAMA_MODEL=llama3.2:latest
+  OLLAMA_KEEP_ALIVE=5m
+
+  LOCAL_LLM_BASE_URL=http://127.0.0.1:1234/v1
+  LOCAL_LLM_MODEL=local-model
+  LOCAL_LLM_API_KEY=
+  LOCAL_LLM_TEMPERATURE=0.3
 """
 
 import asyncio
@@ -48,12 +100,11 @@ import time
 import urllib.parse
 from collections import deque
 from contextlib import suppress
-from typing import Any, Deque, Dict, List, Optional, Tuple, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
-from meshcore import MeshCore, EventType
+from meshcore import EventType, MeshCore
 
-# Gemini optional
 try:
     from google import genai  # type: ignore
 except Exception:
@@ -62,6 +113,17 @@ except Exception:
 
 class WatchdogTimeout(RuntimeError):
     pass
+
+
+# ---------------------------
+# helpers
+# ---------------------------
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
+    "Keep replies short and directly useful (prefer 1–3 sentences). "
+    "If uncertain, say so briefly."
+)
 
 
 def env_int(name: str, default: int) -> int:
@@ -143,15 +205,71 @@ async def resolve_channels(mesh: MeshCore, channel_names: List[str], max_channel
     return found
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise assistant replying over a low-bandwidth MeshCore channel. "
-    "Keep replies short and directly useful (prefer 1–3 sentences). "
-    "If uncertain, say so briefly."
-)
+async def create_mesh_connection() -> MeshCore:
+    transport = env_str("MESHCORE_TRANSPORT", "tcp").strip().lower()
+
+    if transport == "tcp":
+        host = env_str("MESHCORE_HOST", "")
+        if not host:
+            raise RuntimeError("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
+        port = env_int("MESHCORE_PORT", 5000)
+        print(f"[INFO] MeshCore transport=tcp host={host} port={port}")
+        mesh = await MeshCore.create_tcp(host, port, auto_reconnect=False)
+        if mesh is None:
+            raise RuntimeError("MeshCore.create_tcp() returned None")
+        return mesh
+
+    if transport == "serial":
+        serial_port = env_str("MESHCORE_SERIAL_PORT", "")
+        if not serial_port:
+            raise RuntimeError("Missing MESHCORE_SERIAL_PORT (required for MESHCORE_TRANSPORT=serial)")
+        baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
+        print(f"[INFO] MeshCore transport=serial port={serial_port} baud={baud}")
+
+        if hasattr(MeshCore, "create_serial"):
+            mesh = await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
+            if mesh is None:
+                raise RuntimeError("MeshCore.create_serial() returned None")
+            return mesh
+
+        for alt in ("create_uart", "create_usb", "create_serial_port"):
+            if hasattr(MeshCore, alt):
+                fn = getattr(MeshCore, alt)
+                try:
+                    mesh = await fn(serial_port, baud, auto_reconnect=False)
+                except TypeError:
+                    mesh = await fn(serial_port, auto_reconnect=False)
+                if mesh is None:
+                    raise RuntimeError(f"MeshCore.{alt}() returned None")
+                return mesh
+
+        raise RuntimeError(
+            "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
+            "Run: python -c \"from meshcore import MeshCore; print([m for m in dir(MeshCore) if 'create' in m])\""
+        )
+
+    raise RuntimeError("MESHCORE_TRANSPORT must be one of: tcp | serial")
+
+
+async def safe_close_mesh(mesh: Any, debug: bool) -> None:
+    for meth in ("close", "disconnect", "aclose", "stop"):
+        fn = getattr(mesh, meth, None)
+        if fn is None:
+            continue
+        try:
+            result = fn()
+            if asyncio.iscoroutine(result):
+                await result
+            if debug:
+                print(f"[DBG] Mesh closed via {meth}()")
+            return
+        except Exception as e:
+            if debug:
+                print(f"[DBG] Mesh close method {meth} failed: {e}")
 
 
 # ---------------------------
-# LLM Clients
+# llm clients
 # ---------------------------
 
 class LLMClient:
@@ -199,8 +317,7 @@ class OllamaClient(LLMClient):
             messages.append({"role": r, "content": msg})
 
         payload = {"model": self.model, "messages": messages, "stream": False, "keep_alive": self.keep_alive}
-        url = f"{self.base_url}/api/chat"
-        r = await self._http.post(url, json=payload)
+        r = await self._http.post(f"{self.base_url}/api/chat", json=payload)
         r.raise_for_status()
         data = r.json()
         content = (data.get("message") or {}).get("content", "")
@@ -226,7 +343,6 @@ class OpenAICompatClient(LLMClient):
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def generate(self, system_prompt: str, conversation: List[Tuple[str, str]]) -> str:
-        url = f"{self.base_url}/chat/completions"
         headers: Dict[str, str] = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -237,7 +353,7 @@ class OpenAICompatClient(LLMClient):
             messages.append({"role": r, "content": msg})
 
         payload = {"model": self.model, "messages": messages, "temperature": self.temperature}
-        r = await self._http.post(url, headers=headers, json=payload)
+        r = await self._http.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         choices = data.get("choices") or []
@@ -250,8 +366,36 @@ class OpenAICompatClient(LLMClient):
         await self._http.aclose()
 
 
+def build_llm() -> LLMClient:
+    backend = env_str("LLM_BACKEND", "gemini").lower()
+
+    if backend == "gemini":
+        api_key = env_str("GEMINI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Missing GEMINI_API_KEY (required for LLM_BACKEND=gemini)")
+        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
+        return GeminiClient(api_key=api_key, model=model)
+
+    if backend == "ollama":
+        return OllamaClient(
+            base_url=env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+            model=env_str("OLLAMA_MODEL", "llama3.2:latest"),
+            keep_alive=env_str("OLLAMA_KEEP_ALIVE", "5m"),
+        )
+
+    if backend == "openai_compat":
+        return OpenAICompatClient(
+            base_url=env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1"),
+            model=env_str("LOCAL_LLM_MODEL", "local-model"),
+            api_key=env_str("LOCAL_LLM_API_KEY", "") or None,
+            temperature=env_float("LOCAL_LLM_TEMPERATURE", 0.3),
+        )
+
+    raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+
+
 # ---------------------------
-# Bot
+# bot
 # ---------------------------
 
 class ChannelLLMBot:
@@ -518,33 +662,29 @@ class ChannelLLMBot:
     async def fetch_weather(self, location: str) -> str:
         if not location:
             return "No weather location specified."
-    
+
         loc_encoded = urllib.parse.quote(location)
         url = f"https://wttr.in/{loc_encoded}?format=j1"
 
         try:
             async with httpx.AsyncClient(
                 timeout=15.0,
-                headers={"User-Agent": "meshcore-llm-bot/1.0"}
+                headers={"User-Agent": "meshcore-llm-bot/1.0"},
             ) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
 
-                content_type = resp.headers.get("content-type", "")
-                raw_text = resp.text
-
                 if self.debug:
-                    print(f"[DBG] wttr status={resp.status_code} content-type={content_type}")
-                    print(f"[DBG] wttr first 300 chars: {raw_text[:300]!r}")
+                    print(f"[DBG] wttr status={resp.status_code} content-type={resp.headers.get('content-type', '')}")
+                    print(f"[DBG] wttr first 300 chars: {resp.text[:300]!r}")
 
                 data = resp.json()
 
-                # wttr sometimes wraps payload under top-level "data"
-                if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                    data = data["data"]
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                data = data["data"]
 
-                current_list = data.get("current_condition")
-                weather_list = data.get("weather")
+            current_list = data.get("current_condition")
+            weather_list = data.get("weather")
 
             if not isinstance(current_list, list) or not current_list:
                 if self.debug:
@@ -575,22 +715,18 @@ class ChannelLLMBot:
             low_f = today.get("mintempF", "?")
             high_c = today.get("maxtempC", "?")
             low_c = today.get("mintempC", "?")
-    
+
             hourly = today.get("hourly", [])
-            rain_chances = []
-            snow_chances = []
+            rain_chances: List[int] = []
+            snow_chances: List[int] = []
             if isinstance(hourly, list):
                 for h in hourly:
                     if not isinstance(h, dict):
                         continue
-                    try:
+                    with suppress(Exception):
                         rain_chances.append(int(h.get("chanceofrain", "0")))
-                    except Exception:
-                        pass
-                    try:
+                    with suppress(Exception):
                         snow_chances.append(int(h.get("chanceofsnow", "0")))
-                    except Exception:
-                        pass
 
             max_rain = max(rain_chances) if rain_chances else 0
             max_snow = max(snow_chances) if snow_chances else 0
@@ -872,8 +1008,7 @@ class ChannelLLMBot:
 
         h_trigger = self.help_trigger.lower()
         if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
-            reply_text = self.get_help_string(is_ai_chan, is_weather_chan)
-            await self.send_channel_text(ch_idx, reply_text, sender)
+            await self.send_channel_text(ch_idx, self.get_help_string(is_ai_chan, is_weather_chan), sender)
             return
 
         p_trigger = self.ping_trigger.lower()
@@ -885,8 +1020,7 @@ class ChannelLLMBot:
 
             merged = dict(p)
             merged.update({k: v for k, v in matched.items() if v is not None})
-            reply_text = self.get_telemetry_string(merged)
-            await self.send_channel_text(ch_idx, reply_text, sender)
+            await self.send_channel_text(ch_idx, self.get_telemetry_string(merged), sender)
             return
 
         if is_weather_chan:
@@ -905,7 +1039,6 @@ class ChannelLLMBot:
 
             async with self._llm_lock:
                 conversation = self.build_conversation(ch_idx, user)
-
                 try:
                     answer = await self.llm.generate(self.system_prompt, conversation)
                 except Exception as e:
@@ -953,8 +1086,7 @@ class ChannelLLMBot:
 
         h_trigger = self.help_trigger.lower()
         if body_lower == h_trigger or body_lower.startswith(h_trigger + " "):
-            reply_text = self.get_help_string(is_ai=True, is_weather=True)
-            await self.send_dm_text(dst, reply_text)
+            await self.send_dm_text(dst, self.get_help_string(is_ai=True, is_weather=True))
             return
 
         p_trigger = self.ping_trigger.lower()
@@ -966,8 +1098,7 @@ class ChannelLLMBot:
 
             merged = dict(p)
             merged.update({k: v for k, v in matched.items() if v is not None})
-            reply_text = self.get_telemetry_string(merged)
-            await self.send_dm_text(dst, reply_text)
+            await self.send_dm_text(dst, self.get_telemetry_string(merged))
             return
 
         w_trigger = self.weather_trigger.lower()
@@ -989,7 +1120,6 @@ class ChannelLLMBot:
                 self.history[dummy_idx] = deque(maxlen=ml)
 
             conversation = self.build_conversation(dummy_idx, user)
-
             try:
                 answer = await self.llm.generate(self.system_prompt, conversation)
             except Exception as e:
@@ -1001,41 +1131,13 @@ class ChannelLLMBot:
         await self.send_dm_text(dst, answer)
 
 
-async def create_mesh_connection() -> MeshCore:
-    transport = env_str("MESHCORE_TRANSPORT", "tcp").strip().lower()
-
-    if transport == "tcp":
-        host = env_str("MESHCORE_HOST", "")
-        if not host:
-            raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
-        port = env_int("MESHCORE_PORT", 5000)
-        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
-
-    if transport == "serial":
-        serial_port = env_str("MESHCORE_SERIAL_PORT", "")
-        if not serial_port:
-            raise SystemExit("Missing MESHCORE_SERIAL_PORT (required for MESHCORE_TRANSPORT=serial)")
-        baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
-
-        if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
-
-        for alt in ("create_uart", "create_usb", "create_serial_port"):
-            if hasattr(MeshCore, alt):
-                fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=False)
-
-        raise SystemExit(
-            "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
-            "Run: python -c \"from meshcore import MeshCore; print([m for m in dir(MeshCore) if 'create' in m])\""
-        )
-
-    raise SystemExit("MESHCORE_TRANSPORT must be one of: tcp | serial")
-
+# ---------------------------
+# watchdog
+# ---------------------------
 
 async def watchdog_loop(bot: ChannelLLMBot, debug: bool) -> None:
-    idle_timeout_s = env_int("WATCHDOG_IDLE_TIMEOUT_S", 180)
-    check_interval_s = env_int("WATCHDOG_CHECK_INTERVAL_S", 15)
+    idle_timeout_s = env_int("WATCHDOG_IDLE_TIMEOUT_S", 300)
+    check_interval_s = env_int("WATCHDOG_CHECK_INTERVAL_S", 30)
     probe_timeout_s = env_float("WATCHDOG_PROBE_TIMEOUT_S", 8.0)
     probe_retries = env_int("WATCHDOG_PROBE_RETRIES", 2)
 
@@ -1046,14 +1148,12 @@ async def watchdog_loop(bot: ChannelLLMBot, debug: bool) -> None:
         if debug:
             print(f"[DBG] Watchdog idle={idle:.1f}s timeout={idle_timeout_s}s")
 
-        # quiet mesh is OK until idle timeout is exceeded
         if idle <= idle_timeout_s:
             continue
 
         if debug:
             print("[DBG] Watchdog idle threshold exceeded; starting soft probe")
 
-        # soft probe only after long idle
         ok = False
         for attempt in range(1, probe_retries + 1):
             try:
@@ -1074,27 +1174,15 @@ async def watchdog_loop(bot: ChannelLLMBot, debug: bool) -> None:
 
         if not ok:
             raise WatchdogTimeout(
-                f"No MeshCore events for {int(idle)}s and soft probe failed "
-                f"({probe_retries} attempts)"
+                f"No MeshCore events for {int(idle)}s and soft probe failed ({probe_retries} attempts)"
             )
 
-async def safe_close_mesh(mesh: Any, debug: bool) -> None:
-    for meth in ("close", "disconnect", "aclose", "stop"):
-        fn = getattr(mesh, meth, None)
-        if fn is None:
-            continue
-        try:
-            result = fn()
-            if asyncio.iscoroutine(result):
-                await result
-            if debug:
-                print(f"[DBG] Mesh closed via {meth}()")
-            return
-        except Exception as e:
-            if debug:
-                print(f"[DBG] Mesh close method {meth} failed: {e}")
 
-async def run_bot_once() -> None:
+# ---------------------------
+# one bot session
+# ---------------------------
+
+async def run_bot_once(llm: LLMClient) -> str:
     debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
     print(f"[INFO] Starting bot session. Debug mode is: {'ENABLED' if debug else 'DISABLED'}")
 
@@ -1125,29 +1213,6 @@ async def run_bot_once() -> None:
     alerts_zones = env_str("WEATHER_ALERTS_NWS_ZONES", "")
     alerts_interval_m = env_float("WEATHER_ALERTS_POLL_INTERVAL_M", 15.0)
 
-    backend = env_str("LLM_BACKEND", "gemini").lower()
-
-    llm: LLMClient
-    if backend == "gemini":
-        api_key = env_str("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("Missing GEMINI_API_KEY")
-        model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
-        llm = GeminiClient(api_key=api_key, model=model)
-    elif backend == "ollama":
-        base_url = env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        model = env_str("OLLAMA_MODEL", "llama3.2:latest")
-        keep_alive = env_str("OLLAMA_KEEP_ALIVE", "5m")
-        llm = OllamaClient(base_url=base_url, model=model, keep_alive=keep_alive)
-    elif backend == "openai_compat":
-        base_url = env_str("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
-        model = env_str("LOCAL_LLM_MODEL", "local-model")
-        api_key = env_str("LOCAL_LLM_API_KEY", "") or None
-        temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
-        llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
-    else:
-        raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
-
     mesh = await create_mesh_connection()
     tasks: List[asyncio.Task[Any]] = []
 
@@ -1156,6 +1221,18 @@ async def run_bot_once() -> None:
 
         ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
         weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
+
+        print("[OK] AI Channel map:")
+        if not ai_channel_map:
+            print("  (None configured/found)")
+        for idx, name in ai_channel_map.items():
+            print(f"  idx={idx} -> {name}")
+
+        print("[OK] Weather Channel map:")
+        if not weather_channel_map:
+            print("  (None configured/found)")
+        for idx, name in weather_channel_map.items():
+            print(f"  idx={idx} -> {name}")
 
         bot = ChannelLLMBot(
             mesh=mesh,
@@ -1177,6 +1254,16 @@ async def run_bot_once() -> None:
             weather_units=weather_units,
         )
 
+        loop = asyncio.get_running_loop()
+        disconnect_future: asyncio.Future[str] = loop.create_future()
+
+        async def on_disconnected(_ev) -> None:
+            bot.mark_activity()
+            print("[WARN] MeshCore DISCONNECTED event received")
+            if not disconnect_future.done():
+                disconnect_future.set_result("disconnected_event")
+
+        mesh.subscribe(EventType.DISCONNECTED, on_disconnected)
         mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
         mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
         mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
@@ -1188,19 +1275,14 @@ async def run_bot_once() -> None:
 
         if weather_times and weather_location and weather_channel_map:
             tasks.append(asyncio.create_task(bot.scheduled_weather_loop(), name="scheduled_weather"))
+            print(
+                f"[OK] Scheduled weather enabled: Location='{weather_location}', "
+                f"Times={weather_times}, Units={bot.weather_units}"
+            )
 
         if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
             tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m), name="weather_alerts"))
-
-        loop = asyncio.get_running_loop()
-        disconnect_future: asyncio.Future[str] = loop.create_future()
-
-        async def on_disconnected(_ev) -> None:
-            bot.mark_activity()
-            if not disconnect_future.done():
-                disconnect_future.set_result("disconnected_event")
-
-        mesh.subscribe(EventType.DISCONNECTED, on_disconnected)
+            print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
         async def watchdog_wrapper() -> None:
             try:
@@ -1210,12 +1292,20 @@ async def run_bot_once() -> None:
                     disconnect_future.set_result("watchdog_timeout")
             except Exception as e:
                 if not disconnect_future.done():
-                    disconnect_future.set_result(f"watchdog_error:{e}")
+                    disconnect_future.set_result(f"watchdog_error:{type(e).__name__}:{e}")
 
         tasks.append(asyncio.create_task(watchdog_wrapper(), name="watchdog"))
 
+        print("\n[OK] Connected and Listening.")
+        print("--- COMMANDS ---")
+        print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
+        print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
+        print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
+        print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
+
         reason = await disconnect_future
         print(f"[WARN] Session ending: {reason}")
+        return reason
 
     finally:
         for task in tasks:
@@ -1227,28 +1317,47 @@ async def run_bot_once() -> None:
                 pass
 
         with suppress(Exception):
-            await llm.aclose()
-
-        with suppress(Exception):
             await safe_close_mesh(mesh, debug)
 
+
+# ---------------------------
+# main reconnect loop
+# ---------------------------
+
 async def main() -> None:
-    delay = env_int("RECONNECT_DELAY_S", 5)
-    max_delay = env_int("RECONNECT_MAX_DELAY_S", 60)
-    current_delay = delay
+    llm = build_llm()
 
-    while True:
-        try:
-            await run_bot_once()
-            current_delay = delay
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            print(f"[ERR] Bot session crashed: {e}")
+    reconnect_delay = env_int("RECONNECT_DELAY_S", 5)
+    reconnect_max_delay = env_int("RECONNECT_MAX_DELAY_S", 60)
+    delay = reconnect_delay
 
-        print(f"[INFO] reconnecting in {current_delay}s...")
-        await asyncio.sleep(current_delay)
-        current_delay = min(current_delay * 2, max_delay)
+    try:
+        while True:
+            try:
+                reason = await run_bot_once(llm)
+                if reason == "disconnected_event":
+                    delay = reconnect_delay
+                else:
+                    delay = min(delay * 2, reconnect_max_delay)
+            except asyncio.CancelledError:
+                print("[INFO] main task cancelled; shutting down cleanly")
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"[ERR] Bot session crashed: {e}")
+                delay = min(delay * 2, reconnect_max_delay)
+
+            print(f"[INFO] reconnecting in {delay}s...")
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                print("[INFO] reconnect sleep cancelled; shutting down cleanly")
+                break
+    finally:
+        with suppress(Exception):
+            await llm.aclose()
+
 
 if __name__ == "__main__":
     try:
@@ -1256,7 +1365,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted, shutting down.")
         sys.exit(0)
-    except WatchdogTimeout as e:
-        print(f"\n[ERR] Watchdog timeout: {e}")
-        print("[INFO] Exiting cleanly so Docker can restart the container.\n")
-        sys.exit(1)
