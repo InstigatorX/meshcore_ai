@@ -632,6 +632,7 @@ class ChannelLLMBot:
                 out = self.format_chan_reply(sender, msg)
                 if out:
                     await self.mesh.commands.send_chan_msg(ch_idx, out)
+                    self.mark_activity()
                     await asyncio.sleep(2)
 
     async def send_dm_text(self, dst: Dict[str, Any], text: str) -> None:
@@ -642,6 +643,7 @@ class ChannelLLMBot:
                 out = self.format_dm_reply(msg)
                 if out:
                     await self.mesh.commands.send_msg(dst, out)
+                    self.mark_activity()
                     await asyncio.sleep(2)
 
     async def scheduled_weather_loop(self) -> None:
@@ -1007,7 +1009,7 @@ async def create_mesh_connection() -> MeshCore:
         if not host:
             raise SystemExit("Missing MESHCORE_HOST (required for MESHCORE_TRANSPORT=tcp)")
         port = env_int("MESHCORE_PORT", 5000)
-        return await MeshCore.create_tcp(host, port, auto_reconnect=True)
+        return await MeshCore.create_tcp(host, port, auto_reconnect=False)
 
     if transport == "serial":
         serial_port = env_str("MESHCORE_SERIAL_PORT", "")
@@ -1016,12 +1018,12 @@ async def create_mesh_connection() -> MeshCore:
         baud = env_int("MESHCORE_SERIAL_BAUD", 115200)
 
         if hasattr(MeshCore, "create_serial"):
-            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=True)  # type: ignore[attr-defined]
+            return await MeshCore.create_serial(serial_port, baud, auto_reconnect=False)  # type: ignore[attr-defined]
 
         for alt in ("create_uart", "create_usb", "create_serial_port"):
             if hasattr(MeshCore, alt):
                 fn = getattr(MeshCore, alt)
-                return await fn(serial_port, baud, auto_reconnect=True)
+                return await fn(serial_port, baud, auto_reconnect=False)
 
         raise SystemExit(
             "Your meshcore package does not expose MeshCore.create_serial (or known alternates). "
@@ -1032,21 +1034,49 @@ async def create_mesh_connection() -> MeshCore:
 
 
 async def watchdog_loop(bot: ChannelLLMBot, debug: bool) -> None:
-    idle_timeout_s = env_int("WATCHDOG_IDLE_TIMEOUT_S", 300)
-    check_interval_s = env_int("WATCHDOG_CHECK_INTERVAL_S", 30)
+    idle_timeout_s = env_int("WATCHDOG_IDLE_TIMEOUT_S", 180)
+    check_interval_s = env_int("WATCHDOG_CHECK_INTERVAL_S", 15)
+    probe_timeout_s = env_float("WATCHDOG_PROBE_TIMEOUT_S", 8.0)
+    probe_retries = env_int("WATCHDOG_PROBE_RETRIES", 2)
 
     while True:
         await asyncio.sleep(check_interval_s)
-        idle = time.monotonic() - bot.last_activity_ts
 
+        idle = time.monotonic() - bot.last_activity_ts
         if debug:
             print(f"[DBG] Watchdog idle={idle:.1f}s timeout={idle_timeout_s}s")
 
-        if idle > idle_timeout_s:
-            raise WatchdogTimeout(
-                f"No MeshCore events received for {int(idle)}s (timeout={idle_timeout_s}s)"
-            )
+        # quiet mesh is OK until idle timeout is exceeded
+        if idle <= idle_timeout_s:
+            continue
 
+        if debug:
+            print("[DBG] Watchdog idle threshold exceeded; starting soft probe")
+
+        # soft probe only after long idle
+        ok = False
+        for attempt in range(1, probe_retries + 1):
+            try:
+                ev = await asyncio.wait_for(bot.mesh.commands.get_channel(0), timeout=probe_timeout_s)
+                if ev is not None and ev.type != EventType.ERROR:
+                    ok = True
+                    bot.mark_activity()
+                    if debug:
+                        print(f"[DBG] Watchdog probe succeeded on attempt {attempt}")
+                    break
+                if debug:
+                    print(f"[DBG] Watchdog probe got ERROR on attempt {attempt}")
+            except Exception as e:
+                if debug:
+                    print(f"[DBG] Watchdog probe failed on attempt {attempt}: {e}")
+
+            await asyncio.sleep(1)
+
+        if not ok:
+            raise WatchdogTimeout(
+                f"No MeshCore events for {int(idle)}s and soft probe failed "
+                f"({probe_retries} attempts)"
+            )
 
 async def safe_close_mesh(mesh: Any, debug: bool) -> None:
     for meth in ("close", "disconnect", "aclose", "stop"):
@@ -1064,10 +1094,9 @@ async def safe_close_mesh(mesh: Any, debug: bool) -> None:
             if debug:
                 print(f"[DBG] Mesh close method {meth} failed: {e}")
 
-
-async def main() -> None:
+async def run_bot_once() -> None:
     debug = env_str("DEBUG", "0").lower() in ("1", "true", "yes")
-    print(f"[INFO] Booting. Debug mode is: {'ENABLED' if debug else 'DISABLED'}")
+    print(f"[INFO] Starting bot session. Debug mode is: {'ENABLED' if debug else 'DISABLED'}")
 
     ai_channels_raw = env_str("MESHCORE_AI_CHANNELS", "#avl-ai")
     target_ai_channels = [c.strip() for c in ai_channels_raw.split(",") if c.strip()]
@@ -1102,7 +1131,7 @@ async def main() -> None:
     if backend == "gemini":
         api_key = env_str("GEMINI_API_KEY", "")
         if not api_key:
-            raise SystemExit("Missing GEMINI_API_KEY (required for LLM_BACKEND=gemini)")
+            raise RuntimeError("Missing GEMINI_API_KEY")
         model = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
         llm = GeminiClient(api_key=api_key, model=model)
     elif backend == "ollama":
@@ -1117,7 +1146,7 @@ async def main() -> None:
         temperature = env_float("LOCAL_LLM_TEMPERATURE", 0.3)
         llm = OpenAICompatClient(base_url=base_url, model=model, api_key=api_key, temperature=temperature)
     else:
-        raise SystemExit("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
+        raise RuntimeError("LLM_BACKEND must be one of: gemini | ollama | openai_compat")
 
     mesh = await create_mesh_connection()
     tasks: List[asyncio.Task[Any]] = []
@@ -1127,18 +1156,6 @@ async def main() -> None:
 
         ai_channel_map = await resolve_channels(mesh, target_ai_channels, max_channels=scan_max)
         weather_channel_map = await resolve_channels(mesh, target_weather_channels, max_channels=scan_max)
-
-        print("[OK] AI Channel map:")
-        if not ai_channel_map:
-            print("  (None configured/found)")
-        for idx, name in ai_channel_map.items():
-            print(f"  idx={idx} -> {name}")
-
-        print("[OK] Weather Channel map:")
-        if not weather_channel_map:
-            print("  (None configured/found)")
-        for idx, name in weather_channel_map.items():
-            print(f"  idx={idx} -> {name}")
 
         bot = ChannelLLMBot(
             mesh=mesh,
@@ -1163,7 +1180,6 @@ async def main() -> None:
         mesh.subscribe(EventType.CONTACTS, bot.on_contacts_event)
         mesh.subscribe(EventType.NEW_CONTACT, bot.on_contacts_event)
         mesh.subscribe(EventType.NEXT_CONTACT, bot.on_contacts_event)
-
         mesh.subscribe(EventType.RX_LOG_DATA, bot.on_rx_log_data)
         mesh.subscribe(EventType.CHANNEL_MSG_RECV, bot.on_channel_msg)
         mesh.subscribe(EventType.CONTACT_MSG_RECV, bot.on_dm_msg)
@@ -1172,36 +1188,43 @@ async def main() -> None:
 
         if weather_times and weather_location and weather_channel_map:
             tasks.append(asyncio.create_task(bot.scheduled_weather_loop(), name="scheduled_weather"))
-            print(f"[OK] Scheduled weather enabled: Location='{weather_location}', Times={weather_times}, Units={bot.weather_units}")
 
         if alerts_zones and alerts_interval_m > 0 and weather_channel_map:
             tasks.append(asyncio.create_task(bot.weather_alerts_loop(alerts_zones, alerts_interval_m), name="weather_alerts"))
-            print(f"[OK] NWS weather alerts polling enabled: Zones='{alerts_zones}', Interval={alerts_interval_m}m")
 
-        tasks.append(asyncio.create_task(watchdog_loop(bot, debug), name="watchdog"))
+        loop = asyncio.get_running_loop()
+        disconnect_future: asyncio.Future[str] = loop.create_future()
 
-        print(f"\n[OK] Connected and Listening.")
-        print(f"[LLM] Backend={backend}")
-        print("--- COMMANDS ---")
-        print(f" [TEST] Help      (Any channel or DM):  '{help_trigger}'")
-        print(f" [TEST] Ping      (Any channel or DM):  '{ping_trigger}'")
-        print(f" [TEST] AI Query  (AI Channels or DM):  '{trigger} hello'")
-        print(f" [TEST] Weather   (Weather Ch. or DM):  '{weather_trigger}' or '{weather_trigger} Paris'\n")
+        async def on_disconnected(_ev) -> None:
+            bot.mark_activity()
+            if not disconnect_future.done():
+                disconnect_future.set_result("disconnected_event")
 
-        await asyncio.sleep(float("inf"))
+        mesh.subscribe(EventType.DISCONNECTED, on_disconnected)
+
+        async def watchdog_wrapper() -> None:
+            try:
+                await watchdog_loop(bot, debug)
+            except WatchdogTimeout:
+                if not disconnect_future.done():
+                    disconnect_future.set_result("watchdog_timeout")
+            except Exception as e:
+                if not disconnect_future.done():
+                    disconnect_future.set_result(f"watchdog_error:{e}")
+
+        tasks.append(asyncio.create_task(watchdog_wrapper(), name="watchdog"))
+
+        reason = await disconnect_future
+        print(f"[WARN] Session ending: {reason}")
 
     finally:
-        task_errors: List[BaseException] = []
-
         for task in tasks:
             task.cancel()
         for task in tasks:
-            try:
+            with suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
+            with suppress(Exception):
                 pass
-            except Exception as e:
-                task_errors.append(e)
 
         with suppress(Exception):
             await llm.aclose()
@@ -1209,9 +1232,23 @@ async def main() -> None:
         with suppress(Exception):
             await safe_close_mesh(mesh, debug)
 
-        if task_errors:
-            raise task_errors[0]
+async def main() -> None:
+    delay = env_int("RECONNECT_DELAY_S", 5)
+    max_delay = env_int("RECONNECT_MAX_DELAY_S", 60)
+    current_delay = delay
 
+    while True:
+        try:
+            await run_bot_once()
+            current_delay = delay
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[ERR] Bot session crashed: {e}")
+
+        print(f"[INFO] reconnecting in {current_delay}s...")
+        await asyncio.sleep(current_delay)
+        current_delay = min(current_delay * 2, max_delay)
 
 if __name__ == "__main__":
     try:
